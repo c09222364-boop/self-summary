@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         数据库 V（可视化数据编辑精简版）
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0-minimal.22
+// @version      3.0.0-minimal.23
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
 // @match        */*
@@ -2049,6 +2049,40 @@
     let menuObserver = null;
     let menuRetryTimer = null;
     let menuInstalled = false;
+    let menuDelegationAttached = false;
+    let lastMenuActivationAt = 0;
+    function menuTargetFromEvent(event) {
+        const target = event?.target;
+        const item = target?.closest?.(`#${MENU_ID}`);
+        return item && doc()?.documentElement?.contains(item) ? item : null;
+    }
+    function activateMenuFromEvent(event) {
+        if (!menuTargetFromEvent(event)) return;
+        if (event.type === 'pointerup' && !['touch', 'pen'].includes(event.pointerType)) return;
+        const now = Date.now();
+        if (now - lastMenuActivationAt < 500) {
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
+        lastMenuActivationAt = now;
+        menuClick(event);
+    }
+    function activateMenuFromKeyboard(event) {
+        if (!['Enter', ' '].includes(event.key) || !menuTargetFromEvent(event)) return;
+        activateMenuFromEvent(event);
+    }
+    function attachMenuDelegation() {
+        if (menuDelegationAttached) return;
+        const document = doc();
+        if (!document) return;
+        // 手机端会重建扩展菜单 DOM；监听 document 而不是菜单节点本身，
+        // 即使可见菜单项被 clone/innerHTML 替换，点击仍能到达编辑器。
+        document.addEventListener('click', activateMenuFromEvent, true);
+        document.addEventListener('pointerup', activateMenuFromEvent, true);
+        document.addEventListener('keydown', activateMenuFromKeyboard, true);
+        menuDelegationAttached = true;
+    }
     function stopMenuWatch() {
         if (menuRetryTimer) {
             clearTimeout(menuRetryTimer);
@@ -2084,10 +2118,6 @@
         item.tabIndex = 0;
         item.title = '打开数据库';
         item.innerHTML = '<div class="fa-fw fa-solid fa-table"></div><span>数据库</span>';
-        item.addEventListener('click', menuClick);
-        item.addEventListener('keydown', event => {
-            if (event.key === 'Enter' || event.key === ' ') menuClick(event);
-        });
         container.appendChild(item);
         menu.appendChild(container);
         menuInstalled = true;
@@ -2138,6 +2168,7 @@
         // 自身去重，不读取任何旧版或其它数据库脚本留下的全局标记。
         if (HOST[MINIMAL_INSTANCE_FLAG]) return;
         HOST[MINIMAL_INSTANCE_FLAG] = true;
+        attachMenuDelegation();
         insertMenu();
         attachChatListener();
         scheduleInitialProjection();
