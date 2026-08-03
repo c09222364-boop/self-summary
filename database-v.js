@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         数据库 V（可视化数据编辑精简版）
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0-minimal.23
+// @version      3.1.0
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
 // @match        */*
@@ -34,6 +34,8 @@
     const WORLD_BOOK_TARGET_KEY = `${PREFIX}_worldbook_target_v1`;
     const WORLD_BOOK_ACTIVE_PROJECTION_KEY = `${PREFIX}_worldbook_active_projection_v2`;
     const UI_ACCENT_THEME_KEY = `${PREFIX}_ui_accent_theme_v1`;
+    const IDB_OPEN_TIMEOUT_MS = 900;
+    const MOBILE_DRAWER_SETTLE_MS = 180;
     // 这些是原版曾经写入聊天消息的已确认字段。卸载式清理只按这份
     // 白名单删除，不会碰 mes、普通 extra 或其它插件的未知字段。
     const LEGACY_MESSAGE_FIELDS = Object.freeze([
@@ -210,14 +212,29 @@
         if (idbPromise) return idbPromise;
         if (!HOST.indexedDB) return Promise.resolve(null);
         idbPromise = new Promise(resolve => {
+            let settled = false;
+            let timeoutId = null;
+            const finish = db => {
+                if (settled) {
+                    try { db?.close?.(); } catch (_) { /* late Safari success */ }
+                    return;
+                }
+                settled = true;
+                if (timeoutId) clearTimeout(timeoutId);
+                resolve(db || null);
+            };
             try {
                 const request = HOST.indexedDB.open(CONFIG_IDB_NAME, 1);
                 request.onupgradeneeded = () => {
                     if (!request.result.objectStoreNames.contains(CONFIG_IDB_STORE)) request.result.createObjectStore(CONFIG_IDB_STORE);
                 };
-                request.onsuccess = () => resolve(request.result);
-                request.onerror = () => resolve(null);
-            } catch (_) { resolve(null); }
+                request.onsuccess = () => finish(request.result);
+                request.onerror = () => finish(null);
+                request.onblocked = () => finish(null);
+                // WebKit can leave indexedDB.open() pending forever. Settings
+                // are optional, so never let them block opening the editor.
+                timeoutId = setTimeout(() => finish(null), IDB_OPEN_TIMEOUT_MS);
+            } catch (_) { finish(null); }
         });
         return idbPromise;
     }
@@ -1530,9 +1547,9 @@
 
     /* -------------------- 单一奶油风界面 -------------------- */
     const CSS = `
-#${ROOT_ID}{--canvas:#fbf8f1;--paper:#fffdf8;--paper-warm:#fffaf2;--paper2:#f4ede2;--line:#ddd2c1;--line-soft:#ebe3d6;--ink:#403a32;--muted:#81786b;--accent:#3978a8;--accent-soft:#eaf2f8;--accent-border:#a9c6da;--accent-ink:#2e638b;--accent-ring:rgba(57,120,168,.22);--danger:#b4625c;position:fixed;inset:0;z-index:2147483000;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);font-size:13px;line-height:1.4;touch-action:manipulation}
+#${ROOT_ID}{--canvas:#fbf8f1;--paper:#fffdf8;--paper-warm:#fffaf2;--paper2:#f4ede2;--line:#ddd2c1;--line-soft:#ebe3d6;--ink:#403a32;--muted:#81786b;--accent:#3978a8;--accent-soft:#eaf2f8;--accent-border:#a9c6da;--accent-ink:#2e638b;--accent-ring:rgba(57,120,168,.22);--danger:#b4625c;position:fixed;top:0;right:0;bottom:0;left:0;inset:0;width:100vw;height:100vh;height:100dvh;z-index:2147483000;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);font-size:13px;line-height:1.4;touch-action:manipulation}
 #${ROOT_ID}[data-accent="green"]{--accent:#4f8068;--accent-soft:#e8f1e9;--accent-border:#b6c9ba;--accent-ink:#3d6e58;--accent-ring:rgba(79,128,104,.2)}
-#${ROOT_ID} *{box-sizing:border-box}#${ROOT_ID} button,#${ROOT_ID} input,#${ROOT_ID} select,#${ROOT_ID} textarea{font:inherit}#${ROOT_ID} .mask{position:absolute;inset:0;background:rgba(57,51,43,.38);backdrop-filter:blur(1.5px);display:flex;align-items:center;justify-content:center;padding:clamp(12px,2.5vw,28px)}
+#${ROOT_ID} *{box-sizing:border-box}#${ROOT_ID} button,#${ROOT_ID} input,#${ROOT_ID} select,#${ROOT_ID} textarea{font:inherit}#${ROOT_ID} .mask{position:absolute;top:0;right:0;bottom:0;left:0;inset:0;background:rgba(57,51,43,.38);backdrop-filter:blur(1.5px);display:flex;align-items:center;justify-content:center;padding:clamp(12px,2.5vw,28px)}#${ROOT_ID} .open-loading{min-width:180px;padding:18px 22px;border:1px solid var(--line);border-radius:5px;background:var(--paper);box-shadow:0 16px 42px rgba(57,46,34,.18);color:var(--muted);font-weight:600;text-align:center}
 #${ROOT_ID} .win{width:min(1120px,100%);height:min(760px,calc(100vh - 24px));height:min(760px,calc(100dvh - 24px));min-height:0;background:var(--canvas);border:1px solid var(--line);border-radius:5px;box-shadow:0 18px 52px rgba(57,46,34,.2);display:flex;flex-direction:column;overflow:hidden;overscroll-behavior:contain}
 #${ROOT_ID} .head{height:49px;display:flex;align-items:center;gap:9px;padding:0 15px;background:var(--paper);border-bottom:1px solid var(--line);flex:none}.head h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.01em}.head .sub{color:var(--muted);font-size:12px}.head .chat-id{max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spacer{flex:1}.iconbtn{border:1px solid transparent;background:transparent;color:var(--muted);font-size:22px;line-height:1;cursor:pointer;padding:3px 7px;border-radius:4px;min-width:32px;min-height:32px}.iconbtn:hover{background:var(--paper2);border-color:var(--line);color:var(--ink)}.theme-toggle{display:flex;align-items:center;justify-content:center;color:var(--accent)}.theme-toggle:hover{color:var(--accent)}.theme-toggle svg{display:block;width:22px;height:22px}
 #${ROOT_ID} .body{min-height:0;flex:1;display:grid;grid-template-columns:212px minmax(0,1fr)}.side{min-width:0;min-height:0;background:var(--paper2);border-right:1px solid var(--line);padding:11px 9px;display:flex;flex-direction:column;align-items:stretch;gap:7px;overflow:hidden}.side-title{flex:0 0 auto;font-weight:700;font-size:12px;color:var(--muted);padding:3px 4px;white-space:nowrap}#acu-sheet-list{display:flex;flex-direction:column;align-items:stretch;gap:4px;overflow-x:hidden;overflow-y:auto;min-height:0;flex:1;scrollbar-width:thin;-webkit-overflow-scrolling:touch}.sheet{display:flex;align-items:center;gap:5px;width:100%;padding:7px 8px;border:1px solid transparent;border-radius:4px;cursor:pointer;min-height:34px;background:transparent}.sheet:hover{background:rgba(255,253,248,.75);border-color:var(--line)}.sheet.active{background:var(--accent-soft);border-color:var(--accent-border);color:var(--accent-ink);font-weight:700}.sheet-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;flex:1}.sheet-order{display:flex;gap:2px;opacity:.12}.sheet:hover .sheet-order,.sheet:focus-within .sheet-order{opacity:.9}.sheet-order .minibtn{padding:2px 5px;min-height:24px}.minibtn{border:1px solid var(--line);background:var(--paper);color:var(--ink);border-radius:4px;padding:6px 9px;min-height:32px;cursor:pointer;transition:border-color .12s,color .12s,background .12s}.minibtn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}.minibtn:disabled{opacity:.45;cursor:not-allowed}.minibtn.danger:hover{border-color:var(--danger);color:var(--danger);background:#fff7f5}.side-actions{display:grid;grid-template-columns:1fr 1fr;flex:0 0 auto;gap:5px;margin-top:auto}.side-actions button{font-size:12px;white-space:nowrap;padding-left:5px;padding-right:5px}
@@ -1988,7 +2005,6 @@
     }
     async function openApp() {
         attachChatListener();
-        if (!app) await loadModel();
         ensureStyle();
         const document = doc();
         let root = document.getElementById(ROOT_ID);
@@ -1996,9 +2012,19 @@
             root = document.createElement('div');
             root.id = ROOT_ID;
             root.dataset.accent = uiAccentTheme;
+            root.innerHTML = '<div class="mask"><div class="open-loading" role="status" aria-live="polite">正在打开数据库…</div></div>';
             document.body.appendChild(root);
         }
         lockHostScroll();
+        try {
+            if (!app) await loadModel();
+        } catch (error) {
+            root.remove();
+            doc().getElementById(`${ROOT_ID}-style`)?.remove();
+            unlockHostScroll();
+            app = null;
+            throw error;
+        }
         // 世界书列表只是编辑器中的可选下拉项。某些移动端宿主会在抽屉
         // 尚未初始化时让其 API 等待很久；先把编辑器显示出来，避免“点了
         // 菜单却没有任何反应”，列表完成后再刷新同一聊天的界面。
@@ -2043,7 +2069,7 @@
         const open = () => void openApp().catch(error => notify(error.message || text(error), 'error'));
         // 手机上的扩展抽屉会在当前 click 结束时完成关闭；等到下一任务再
         // 创建编辑器，避免宿主的收尾逻辑把刚插入的全屏根节点一起覆盖。
-        if (drawerClosed) setTimeout(open, 0);
+        if (drawerClosed) setTimeout(open, MOBILE_DRAWER_SETTLE_MS);
         else open();
     }
     let menuObserver = null;
@@ -2051,9 +2077,11 @@
     let menuInstalled = false;
     let menuDelegationAttached = false;
     let lastMenuActivationAt = 0;
+    let menuTouchStart = null;
     function menuTargetFromEvent(event) {
         const target = event?.target;
-        const item = target?.closest?.(`#${MENU_ID}`);
+        const element = target?.nodeType === 1 ? target : target?.parentElement;
+        const item = element?.closest?.(`#${MENU_ID}`);
         return item && doc()?.documentElement?.contains(item) ? item : null;
     }
     function activateMenuFromEvent(event) {
@@ -2068,6 +2096,23 @@
         lastMenuActivationAt = now;
         menuClick(event);
     }
+    function rememberMenuTouch(event) {
+        if (!menuTargetFromEvent(event)) { menuTouchStart = null; return; }
+        const touch = event.touches?.[0] || event.changedTouches?.[0];
+        menuTouchStart = touch ? { id: touch.identifier, x: touch.clientX, y: touch.clientY } : null;
+    }
+    function activateMenuFromTouch(event) {
+        if (!menuTouchStart || !menuTargetFromEvent(event)) { menuTouchStart = null; return; }
+        const touches = Array.from(event.changedTouches || []);
+        const touch = touches.find(item => item.identifier === menuTouchStart.id) || touches[0];
+        const start = menuTouchStart;
+        menuTouchStart = null;
+        if (!touch || Math.hypot(touch.clientX - start.x, touch.clientY - start.y) > 14) return;
+        activateMenuFromEvent(event);
+    }
+    function resetMenuTouch() {
+        menuTouchStart = null;
+    }
     function activateMenuFromKeyboard(event) {
         if (!['Enter', ' '].includes(event.key) || !menuTargetFromEvent(event)) return;
         activateMenuFromEvent(event);
@@ -2080,8 +2125,26 @@
         // 即使可见菜单项被 clone/innerHTML 替换，点击仍能到达编辑器。
         document.addEventListener('click', activateMenuFromEvent, true);
         document.addEventListener('pointerup', activateMenuFromEvent, true);
+        document.addEventListener('touchstart', rememberMenuTouch, { capture: true, passive: true });
+        document.addEventListener('touchend', activateMenuFromTouch, { capture: true, passive: false });
+        document.addEventListener('touchcancel', resetMenuTouch, { capture: true, passive: true });
         document.addEventListener('keydown', activateMenuFromKeyboard, true);
         menuDelegationAttached = true;
+    }
+    function bindMenuItem(item) {
+        if (!item) return;
+        item.removeEventListener('click', activateMenuFromEvent);
+        item.removeEventListener('pointerup', activateMenuFromEvent);
+        item.removeEventListener('touchstart', rememberMenuTouch);
+        item.removeEventListener('touchend', activateMenuFromTouch);
+        item.removeEventListener('touchcancel', resetMenuTouch);
+        item.removeEventListener('keydown', activateMenuFromKeyboard);
+        item.addEventListener('click', activateMenuFromEvent);
+        item.addEventListener('pointerup', activateMenuFromEvent);
+        item.addEventListener('touchstart', rememberMenuTouch, { passive: true });
+        item.addEventListener('touchend', activateMenuFromTouch, { passive: false });
+        item.addEventListener('touchcancel', resetMenuTouch, { passive: true });
+        item.addEventListener('keydown', activateMenuFromKeyboard);
     }
     function stopMenuWatch() {
         if (menuRetryTimer) {
@@ -2098,6 +2161,7 @@
         if (!document) return false;
         const existing = document.getElementById(MENU_ID);
         if (existing) {
+            bindMenuItem(existing);
             menuInstalled = true;
             stopMenuWatch();
             return true;
@@ -2118,6 +2182,7 @@
         item.tabIndex = 0;
         item.title = '打开数据库';
         item.innerHTML = '<div class="fa-fw fa-solid fa-table"></div><span>数据库</span>';
+        bindMenuItem(item);
         container.appendChild(item);
         menu.appendChild(container);
         menuInstalled = true;
