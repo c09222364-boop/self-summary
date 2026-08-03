@@ -1,0 +1,12 @@
+{
+    "display_name": "自用总结",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "database-v.js",
+    "css": "",
+    "author": "c09222364-boop",
+    "version": "3.0.0-minimal.22",
+    "homePage": "https://github.com/c09222364-boop/self-summary",
+    "auto_update": true
+}
