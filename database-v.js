@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         数据库 V（可视化数据编辑精简版）
 // @namespace    http://tampermonkey.net/
-// @version      3.5.0
+// @version      3.6.0
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
 // @match        */*
@@ -30,6 +30,7 @@
     const ROOT_ID = 'acu-minimal-editor-root';
     const NOTICE_ID = 'acu-minimal-editor-notices';
     const PAGE_SIZE = 50;
+    const STORY_DATE_AI_LOOKBACK = 5;
     const MANAGED_COMMENT_PREFIX = 'TavernDB-ACU-CustomExport-';
     const WORLD_BOOK_TARGET_KEY = `${PREFIX}_worldbook_target_v1`;
     const WORLD_BOOK_ACTIVE_PROJECTION_KEY = `${PREFIX}_worldbook_active_projection_v2`;
@@ -564,6 +565,8 @@
             extraIndexColumns: delimitedList(source.extraIndexColumns),
             extraIndexInjectionTemplate: text(source.extraIndexInjectionTemplate),
             extraIndexPlacement: normalizePlacement(source.extraIndexPlacement, defaultExtraPlacement()),
+            relativeTimeEnabled: source.relativeTimeEnabled === true,
+            relativeTimeColumn: text(source.relativeTimeColumn),
         };
     }
     function normalizeSheet(raw, key, keepRows = true) {
@@ -1075,6 +1078,111 @@
         const rowLine = row => `| ${columns.map((_, index) => cell(row?.[index + 1])).join(' | ')} |`;
         return [`| ${columns.join(' | ')} |`, `|${columns.map(() => '---').join('|')}|`, ...rows.map(rowLine)].join('\n');
     }
+    function calendarDate(yearValue, monthValue, dayValue) {
+        const year = Number(yearValue), month = Number(monthValue), day = Number(dayValue);
+        if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)
+            || year < 1 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+        const stamp = Date.UTC(year, month - 1, day);
+        const value = new Date(stamp);
+        if (value.getUTCFullYear() !== year || value.getUTCMonth() !== month - 1 || value.getUTCDate() !== day) return null;
+        return { year, month, day, stamp, label: `${year}年${month}月${day}日` };
+    }
+    function dateSegment(source, startIndex, maxLength = 180) {
+        const rest = text(source).slice(startIndex, startIndex + maxLength);
+        const ends = [rest.indexOf('】'), rest.search(/[\r\n]/)].filter(index => index >= 0);
+        return ends.length ? rest.slice(0, Math.min(...ends)) : rest;
+    }
+    function spanEndDate(source, firstDate, tailIndex) {
+        const segment = dateSegment(source, tailIndex);
+        const range = /(?:至|到|—|–|－|-|~|～)\s*(?:(\d{4})\s*年\s*)?(?:(\d{1,2})\s*月\s*)?(\d{1,2})\s*日/g;
+        let best = firstDate;
+        for (const match of segment.matchAll(range)) {
+            const candidate = calendarDate(match[1] || firstDate.year, match[2] || firstDate.month, match[3]);
+            if (candidate && candidate.stamp >= firstDate.stamp && candidate.stamp >= best.stamp) best = candidate;
+        }
+        return best;
+    }
+    function bracketStoryDate(source) {
+        const value = text(source);
+        const prefix = /【\s*(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
+        let latest = null;
+        for (const match of value.matchAll(prefix)) {
+            const first = calendarDate(match[1], match[2], match[3]);
+            if (!first) continue;
+            latest = spanEndDate(value, first, match.index + match[0].length);
+        }
+        return latest;
+    }
+    function storyDateFromMessage(message) {
+        const value = text(message?.mes);
+        if (!value) return null;
+        const contentTags = [...value.matchAll(/<content(?:\s[^>]*)?>/gi)];
+        if (contentTags.length) {
+            const marker = contentTags[contentTags.length - 1];
+            const afterContent = value.slice(marker.index + marker[0].length);
+            const preferred = bracketStoryDate(afterContent);
+            if (preferred) return preferred;
+        }
+        // 没有 content 标签或标签后的日期缺失时，只看消息开头，避免把
+        // 正文中角色回忆、对白里的旧日期误当成当前剧情日期。
+        return bracketStoryDate(value.slice(0, 600));
+    }
+    function latestStoryDate(messages = chat()) {
+        const source = Array.isArray(messages) ? messages : [];
+        let inspected = 0;
+        let aiFloor = aiFloorCount(source);
+        for (let index = source.length - 1; index >= 0 && inspected < STORY_DATE_AI_LOOKBACK; index -= 1) {
+            const message = source[index];
+            if (!message || message.is_user) continue;
+            inspected += 1;
+            const found = storyDateFromMessage(message);
+            if (found) return { ...found, index, aiFloor, inspected };
+            aiFloor -= 1;
+        }
+        return null;
+    }
+    function dateFromTableCell(value) {
+        const source = text(value);
+        const full = /(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/g;
+        let best = null;
+        for (const match of source.matchAll(full)) {
+            const first = calendarDate(match[1], match[2], match[3]);
+            if (!first) continue;
+            const candidate = spanEndDate(source, first, match.index + match[0].length);
+            if (!best || candidate.stamp > best.stamp) best = candidate;
+        }
+        return best;
+    }
+    function relativeStoryTime(rowDate, anchorDate) {
+        if (!rowDate || !anchorDate) return '';
+        const days = Math.round((anchorDate.stamp - rowDate.stamp) / 86400000);
+        if (days < 0) return '晚于当前剧情';
+        if (days === 0) return '当天';
+        if (days < 7) return `${days}天前`;
+        if (days < 14) return '约1周前';
+        if (days < 28) return `约${Math.round(days / 7)}周前`;
+        if (days < 60) return '约1个月前';
+        if (days < 335) return `约${Math.round(days / 30)}个月前`;
+        if (days < 548) return '约1年前';
+        return `约${Math.round(days / 365)}年前`;
+    }
+    function relativeProjection(config, header, rows, anchorDate) {
+        if (!config.relativeTimeEnabled) return { applied: false, reason: 'disabled', header, rows };
+        if (!anchorDate) return { applied: false, reason: 'no-anchor', header, rows };
+        const timeColumn = header.findIndex(value => text(value).trim() === text(config.relativeTimeColumn).trim());
+        if (timeColumn < 1) return { applied: false, reason: 'no-column', header, rows };
+        const values = rows.map(row => relativeStoryTime(dateFromTableCell(row?.[timeColumn]), anchorDate));
+        if (!values.some(Boolean)) return { applied: false, reason: 'no-row-date', header, rows };
+        const insertAt = timeColumn + 1;
+        return {
+            applied: true,
+            reason: '',
+            parsedRows: values.filter(Boolean).length,
+            blankRows: values.filter(value => !value).length,
+            header: [...header.slice(0, insertAt), '距当前剧情', ...header.slice(insertAt)],
+            rows: rows.map((row, index) => [...row.slice(0, insertAt), values[index], ...row.slice(insertAt)]),
+        };
+    }
     const keywordList = value => delimitedList(value);
     function resolveEntryKeys(config, header, rows) {
         const keys = [];
@@ -1158,6 +1266,15 @@
         }
         const managed = existing.filter(entry => text(entry?.comment).startsWith(scopedPrefix));
         const candidates = [];
+        const storyDate = latestStoryDate(chat());
+        const relativeTime = {
+            enabledTables: 0,
+            appliedTables: 0,
+            parsedRows: 0,
+            blankRows: 0,
+            skipped: [],
+            anchor: storyDate,
+        };
         const addCandidate = (identity, name, content, keys, placementConfig, type, preventRecursion) => {
             const entryType = type === 'keyword' ? 'keyword' : 'constant';
             const entryKeys = entryType === 'keyword' ? [...new Set(keys || [])] : [];
@@ -1174,8 +1291,23 @@
             if (!rows.length) return;
             const name = config.entryName || sheet.name || key;
             const identity = text(sheet.uid || key);
+            const projected = relativeProjection(config, header, rows, storyDate);
+            if (config.relativeTimeEnabled) {
+                relativeTime.enabledTables += 1;
+                if (projected.applied) {
+                    relativeTime.appliedTables += 1;
+                    relativeTime.parsedRows += projected.parsedRows;
+                    relativeTime.blankRows += projected.blankRows;
+                } else {
+                    relativeTime.skipped.push({ key, name: sheet.name || key, reason: projected.reason });
+                }
+            }
+            const projectedRows = new Map(rows.map((row, index) => [row, projected.rows[index]]));
             const render = selectedRows => {
-                const table = markdownTable(header, selectedRows);
+                const outputRows = projected.applied
+                    ? selectedRows.map(row => projectedRows.get(row) || row)
+                    : selectedRows;
+                const table = markdownTable(projected.header, outputRows);
                 return config.injectionTemplate
                     ? config.injectionTemplate.replace('$1', table)
                     : `# ${name}\n\n${table}`;
@@ -1264,8 +1396,19 @@
             if (!isFresh()) return { ok: false, stale: true };
             if (desired.length) await rememberCurrentProjection();
             else await writeActiveWorldbookProjection(null);
-            if (!silent) notify(`世界书已同步：更新 ${updates.length} 条，新增 ${creates.length} 条，清理旧条目 ${staleIds.length + previousRemoved} 条。`, 'success');
-            return { ok: true, updated: updates.length, created: creates.length, removed: staleIds.length + previousRemoved };
+            if (!silent) {
+                let relativeMessage = '';
+                let tone = 'success';
+                if (relativeTime.enabledTables && !storyDate) {
+                    relativeMessage = ` 最新 AI 楼层及前 ${STORY_DATE_AI_LOOKBACK - 1} 层没有识别到“【2025年9月19日”格式，相对时间未生成。`;
+                    tone = 'warning';
+                } else if (relativeTime.enabledTables) {
+                    relativeMessage = ` 剧情日期：${storyDate.label}（AI 第 ${storyDate.aiFloor} 层）；相对时间已用于 ${relativeTime.appliedTables}/${relativeTime.enabledTables} 张表。`;
+                    if (relativeTime.appliedTables < relativeTime.enabledTables) tone = 'warning';
+                }
+                notify(`世界书已同步：更新 ${updates.length} 条，新增 ${creates.length} 条，清理旧条目 ${staleIds.length + previousRemoved} 条。${relativeMessage}`, tone);
+            }
+            return { ok: true, updated: updates.length, created: creates.length, removed: staleIds.length + previousRemoved, relativeTime };
         } catch (error) {
             if (!silent) notify(`世界书同步失败：${error?.message || error}`, 'error');
             else console.warn('[数据库] 自动同步世界书失败：', error);
@@ -1520,9 +1663,17 @@
         });
         if (session) assertSaveSession(session);
         targetApp.dirtyTemplate = false;
-        notify(projection?.ok === false && !projection.stale
+        const relative = projection?.relativeTime;
+        const relativeMessage = relative?.enabledTables
+            ? relative.anchor
+                ? ` 剧情日期：${relative.anchor.label}（AI 第 ${relative.anchor.aiFloor} 层）；相对时间已用于 ${relative.appliedTables}/${relative.enabledTables} 张表。`
+                : ` 最新 AI 楼层及前 ${STORY_DATE_AI_LOOKBACK - 1} 层没有识别到“【2025年9月19日”格式，相对时间未生成。`
+            : '';
+        const projectionFailed = projection?.ok === false && !projection.stale;
+        const relativeIncomplete = relative?.enabledTables && relative.appliedTables < relative.enabledTables;
+        notify(projectionFailed
             ? `模板已保存，但世界书未同步：${projection.message || '接口不可用'}`
-            : '已保存到当前聊天模板并同步世界书。', projection?.ok === false && !projection.stale ? 'warning' : 'success');
+            : `已保存到当前聊天模板并同步世界书。${relativeMessage}`, projectionFailed || relativeIncomplete ? 'warning' : 'success');
     }
     async function saveData(session = null) {
         const activeSession = session || createSaveSession();
@@ -1564,9 +1715,10 @@
 #${ROOT_ID} .head{height:49px;display:flex;align-items:center;gap:9px;padding:0 15px;background:var(--paper);border-bottom:1px solid var(--line);flex:none}.head h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.01em}.head .sub{color:var(--muted);font-size:12px}.head .chat-id{max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.spacer{flex:1}.iconbtn{border:1px solid transparent;background:transparent;color:var(--muted);font-size:22px;line-height:1;cursor:pointer;padding:3px 7px;border-radius:4px;min-width:32px;min-height:32px}.iconbtn:hover{background:var(--paper2);border-color:var(--line);color:var(--ink)}.theme-toggle{display:flex;align-items:center;justify-content:center;color:var(--accent)}.theme-toggle:hover{color:var(--accent)}.theme-toggle svg{display:block;width:22px;height:22px}
 #${ROOT_ID} .body{min-height:0;flex:1;display:grid;grid-template-columns:212px minmax(0,1fr)}.side{min-width:0;min-height:0;background:var(--paper2);border-right:1px solid var(--line);padding:11px 9px;display:flex;flex-direction:column;align-items:stretch;gap:7px;overflow:hidden}.side-title{flex:0 0 auto;font-weight:700;font-size:12px;color:var(--muted);padding:3px 4px;white-space:nowrap}#acu-sheet-list{display:flex;flex-direction:column;align-items:stretch;gap:4px;overflow-x:hidden;overflow-y:auto;min-height:0;flex:1;scrollbar-width:thin;-webkit-overflow-scrolling:touch}.sheet{display:flex;align-items:center;gap:5px;width:100%;padding:7px 8px;border:1px solid transparent;border-radius:4px;cursor:pointer;min-height:34px;background:transparent}.sheet:hover{background:rgba(255,253,248,.75);border-color:var(--line)}.sheet.active{background:var(--accent-soft);border-color:var(--accent-border);color:var(--accent-ink);font-weight:700}.sheet-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%;flex:1}.sheet-order{display:flex;gap:2px;opacity:.12}.sheet:hover .sheet-order,.sheet:focus-within .sheet-order{opacity:.9}.sheet-order .minibtn{padding:2px 5px;min-height:24px}.minibtn{border:1px solid var(--line);background:var(--paper);color:var(--ink);border-radius:4px;padding:6px 9px;min-height:32px;cursor:pointer;transition:border-color .12s,color .12s,background .12s}.minibtn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}.minibtn:disabled{opacity:.45;cursor:not-allowed}.minibtn.danger:hover{border-color:var(--danger);color:var(--danger);background:#fff7f5}.side-actions{display:grid;grid-template-columns:1fr 1fr;flex:0 0 auto;gap:5px;margin-top:auto}.side-actions button{font-size:12px;white-space:nowrap;padding-left:5px;padding-right:5px}
 #${ROOT_ID} .main{min-width:0;min-height:0;display:flex;flex-direction:column;overflow:hidden}.tabs{display:flex;gap:0;padding:0 13px;background:var(--paper);border-bottom:1px solid var(--line);flex:none;overflow-x:auto;white-space:nowrap;scrollbar-width:thin;-webkit-overflow-scrolling:touch}.tab{border:0;border-bottom:3px solid transparent;background:transparent;color:var(--muted);padding:0 21px;height:45px;cursor:pointer;font-size:13px;flex:0 0 auto}.tab:hover{color:var(--accent);background:var(--accent-soft)}.tab.active{color:var(--accent);font-weight:700;border-bottom-color:var(--accent)}.content{padding:13px 15px;overflow:auto;flex:1;min-height:0;background:var(--canvas);-webkit-overflow-scrolling:touch}.content.data-content{display:flex;flex-direction:column;overflow:hidden}.data-content .toolbar{flex:none}.toolbar{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:9px}.toolbar .grow,.foot .grow{flex:1}.toolbar strong{font-size:15px}.btn{border:1px solid var(--accent);background:var(--accent);color:#fff;border-radius:4px;padding:7px 11px;min-height:34px;cursor:pointer;font-size:13px;transition:filter .12s,background .12s,border-color .12s}.btn:hover{filter:brightness(.96)}.btn.secondary{border-color:var(--line);background:var(--paper);color:var(--ink)}.btn.secondary:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft)}.btn.warn{border-color:var(--danger);background:transparent;color:var(--danger)}
-#${ROOT_ID} .card{background:var(--paper);border:1px solid var(--line);border-radius:5px;padding:13px;margin-bottom:9px}.card h2{margin:0 0 9px;font-size:14px}.card h3{margin:0 0 3px;font-size:13px}.hint{font-size:12px;color:var(--muted);line-height:1.5}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.form-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px 12px;align-items:start}.form-grid .col-4{grid-column:span 4}.form-grid .col-6{grid-column:span 6}.form-grid .col-8{grid-column:span 8}.form-grid .wide{grid-column:1/-1}.field{display:flex;flex-direction:column;gap:4px;min-width:0}.field label,.field>span{font-size:12px;color:var(--muted)}.field-note{font-size:11px!important;line-height:1.45}.field input,.field select,.field textarea,.column-row input{width:100%;border:1px solid var(--line);background:var(--paper-warm);color:var(--ink);border-radius:4px;padding:7px 9px;min-height:34px}.field input:focus,.field select:focus,.field textarea:focus,.column-row input:focus{outline:2px solid var(--accent-ring);outline-offset:0;border-color:var(--accent)}.field input:disabled,.field select:disabled,.field textarea:disabled{background:#f2eee7;color:#aaa196;cursor:not-allowed}.field textarea{min-height:82px;resize:vertical}.check{display:flex;align-items:center;gap:6px;min-height:32px}.check input{width:auto;accent-color:var(--accent)}.strong-check{font-weight:700;color:var(--accent);white-space:nowrap}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:10px}.section-head h2{margin-bottom:3px}.section-head.compact{margin-bottom:10px}.option-strip{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:12px;padding:7px 10px;border:1px solid var(--line-soft);border-radius:4px;background:var(--paper2)}.subpanel{margin-top:14px;padding-top:13px;border-top:1px solid var(--line)}.target-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:8px;margin-bottom:7px}.placement-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(88px,.75fr) minmax(88px,.75fr);gap:8px}.columns{display:flex;flex-direction:column;gap:6px}.column-row{display:flex;gap:7px;align-items:center}.column-row input{flex:1;min-width:0}.column-row .index{width:24px;color:var(--muted);text-align:center;font-size:12px}
+#${ROOT_ID} .card{background:var(--paper);border:1px solid var(--line);border-radius:5px;padding:13px;margin-bottom:9px}.card h2{margin:0 0 9px;font-size:14px}.card h3{margin:0 0 3px;font-size:13px}.hint{font-size:12px;color:var(--muted);line-height:1.5}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.form-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:10px 12px;align-items:start}.form-grid .col-4{grid-column:span 4}.form-grid .col-6{grid-column:span 6}.form-grid .col-8{grid-column:span 8}.form-grid .wide{grid-column:1/-1}.field{display:flex;flex-direction:column;gap:4px;min-width:0}.field label,.field>span{font-size:12px;color:var(--muted)}.field-note{font-size:11px!important;line-height:1.45}.field input,.field select,.field textarea,.column-row input{width:100%;border:1px solid var(--line);background:var(--paper-warm);color:var(--ink);border-radius:4px;padding:7px 9px;min-height:34px}.field input:focus,.field select:focus,.field textarea:focus,.column-row input:focus{outline:2px solid var(--accent-ring);outline-offset:0;border-color:var(--accent)}.field input:disabled,.field select:disabled,.field textarea:disabled{background:#f2eee7;color:#aaa196;cursor:not-allowed}.field textarea{min-height:82px;resize:vertical}.check{display:flex;align-items:center;gap:6px;min-height:32px}.check input{width:auto;accent-color:var(--accent)}.strong-check{font-weight:700;color:var(--accent);white-space:nowrap}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:10px}.section-head>.check{flex:0 0 auto;white-space:nowrap}.section-head h2{margin-bottom:3px}.section-head.compact{margin-bottom:10px}.option-strip{display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:12px;padding:7px 10px;border:1px solid var(--line-soft);border-radius:4px;background:var(--paper2)}.subpanel{margin-top:14px;padding-top:13px;border-top:1px solid var(--line)}.target-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:end;gap:8px;margin-bottom:7px}.placement-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(88px,.75fr) minmax(88px,.75fr);gap:8px}.columns{display:flex;flex-direction:column;gap:6px}.column-row{display:flex;gap:7px;align-items:center}.column-row input{flex:1;min-width:0}.column-row .index{width:24px;color:var(--muted);text-align:center;font-size:12px}
 #${ROOT_ID} .empty{padding:32px;text-align:center;color:var(--muted)}
 #${ROOT_ID} .record-list{display:flex;flex-direction:column;gap:9px;overflow:auto;min-height:0;flex:1;padding-right:2px;scrollbar-width:thin;-webkit-overflow-scrolling:touch}.record-card{overflow:hidden;flex:none;border:1px solid var(--line);border-radius:5px;background:var(--paper-warm)}.record-head{display:flex;align-items:center;gap:10px;min-height:38px;padding:6px 10px;border-bottom:1px solid var(--line-soft);background:var(--paper2)}.record-number{color:var(--accent-ink);font-family:ui-monospace,Consolas,monospace;font-size:12px;font-weight:700;white-space:nowrap}.record-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:700}.record-head .record-delete{margin-left:auto;padding:4px 8px;min-height:28px;font-size:11px}.record-fields{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:0 10px;padding:3px 10px 10px}.record-field{min-width:0;padding:9px 8px;border-top:1px solid var(--line-soft)}.record-field.short{grid-column:span 1}.record-field.medium{grid-column:span 2}.record-field.long{grid-column:1/-1}.record-label{display:block;margin-bottom:4px;color:var(--muted);font-size:11px;font-weight:600}.record-value{min-height:22px;outline:none;font-size:13px;line-height:1.55;overflow-wrap:anywhere;white-space:pre-wrap}.record-value:focus{background:var(--accent-soft);box-shadow:0 0 0 1px var(--accent);border-radius:3px}.add-row-compact{padding:4px 7px;min-height:28px;font-size:11px}
+#${ROOT_ID} .record-name{outline:none}.record-name:empty::before{content:attr(data-placeholder);color:var(--muted);font-weight:400}.record-name:focus{background:var(--accent-soft);box-shadow:0 0 0 1px var(--accent);border-radius:3px}
 #${ROOT_ID} .status-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.stat{padding:10px;border:1px solid var(--line-soft);border-radius:4px;background:var(--paper2)}.stat b{display:block;font-size:12px;color:var(--muted);font-weight:600;margin-bottom:3px}.full-checkpoint-stat{grid-column:1/-1}.full-checkpoint-stat span{display:block;max-height:132px;line-height:1.55;overflow:auto;overflow-wrap:anywhere}.code{font-family:ui-monospace,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word;background:var(--paper2);padding:10px;border:1px solid var(--line-soft);border-radius:4px;max-height:260px;overflow:auto}
 #${ROOT_ID} .foot{display:flex;align-items:center;gap:7px;padding:8px 13px calc(8px + env(safe-area-inset-bottom,0px));background:var(--paper);border-top:1px solid var(--line);flex:none}.dirty{color:#987044;font-size:12px}.file{display:none}#${ROOT_ID} button,#${ROOT_ID} select,#${ROOT_ID} input,#${ROOT_ID} textarea{touch-action:manipulation}
 #${ROOT_ID} #acu-sheet-list,#${ROOT_ID} .content,#${ROOT_ID} .record-list{min-width:0}
@@ -1670,15 +1822,15 @@
         const layout = pageRows(rows, app.page, app.reverseRows, PAGE_SIZE);
         app.page = layout.page;
         const orderLabel = app.reverseRows ? '倒序' : '正序';
-        const labels = header.slice(1);
+        const labels = header.slice(2);
         const records = layout.items.map(item => {
             const rowNumber = text(item.row?.[0]).replace(/^#\s*/, '');
-            const recordName = text(item.row?.[1]).trim() || '未填写';
+            const recordName = text(item.row?.[1]).trim();
             const fields = labels.map((label, columnIndex) => {
-                const value = item.row?.[columnIndex + 1];
-                return `<div class="record-field ${recordFieldSize(value, label)}"><span class="record-label">${esc(label)}</span><div class="record-value" contenteditable="true" data-cell-row="${item.physicalIndex + 1}" data-cell-col="${columnIndex + 1}">${esc(value)}</div></div>`;
+                const value = item.row?.[columnIndex + 2];
+                return `<div class="record-field ${recordFieldSize(value, label)}"><span class="record-label">${esc(label)}</span><div class="record-value" contenteditable="true" data-cell-row="${item.physicalIndex + 1}" data-cell-col="${columnIndex + 2}">${esc(value)}</div></div>`;
             }).join('');
-            return `<article class="record-card"><header class="record-head"><span class="record-number">#${esc(rowNumber)}</span><span class="record-name">${esc(recordName)}</span><button class="minibtn danger record-delete" data-act="delete-row" data-row="${item.physicalIndex + 1}">删除</button></header><div class="record-fields">${fields}</div></article>`;
+            return `<article class="record-card"><header class="record-head"><span class="record-number">#${esc(rowNumber)}</span><span class="record-name" contenteditable="true" data-placeholder="未填写" data-cell-row="${item.physicalIndex + 1}" data-cell-col="1">${esc(recordName)}</span><button class="minibtn danger record-delete" data-act="delete-row" data-row="${item.physicalIndex + 1}">删除</button></header><div class="record-fields">${fields}</div></article>`;
         }).join('');
         element.innerHTML = `<div class="toolbar"><strong>${esc(sheet.name)}</strong><span class="hint">${rows.length} 行 · 第 ${app.page + 1}/${layout.pageCount} 页 · 当前 ${orderLabel}</span><button class="minibtn" data-act="prev-page" ${app.page <= 0 ? 'disabled' : ''}>上一页</button><button class="minibtn" data-act="next-page" ${app.page >= layout.pageCount - 1 ? 'disabled' : ''}>下一页</button><button class="minibtn" data-act="toggle-row-order">${app.reverseRows ? '切换正序' : '切换倒序'}</button><span class="grow"></span><button class="minibtn add-row-compact" data-act="add-row">＋ 添加行</button></div><div class="record-list">${records}${rows.length ? '' : '<div class="empty">还没有数据行，点击“添加行”。</div>'}</div>`;
     }
@@ -1698,6 +1850,12 @@
         const header = sheet.content?.[0] || [null];
         const keywordDisabled = config.entryType === 'keyword' ? '' : ' disabled';
         const extraDisabled = config.extraIndexEnabled ? '' : ' disabled';
+        const relativeDisabled = config.relativeTimeEnabled ? '' : ' disabled';
+        const detectedStoryDate = latestStoryDate(chat());
+        const relativeColumnOptions = header.slice(1).map(value => {
+            const name = text(value).trim();
+            return `<option value="${esc(name)}" ${name === config.relativeTimeColumn ? 'selected' : ''}>${esc(name || '未命名列')}</option>`;
+        }).join('');
         element.innerHTML = `<div class="toolbar"><strong>结构与世界书注入</strong><span class="grow"></span><button class="btn secondary" data-act="save-template-chat">保存结构并同步世界书</button></div>
           <section class="card"><h2>基本信息</h2><div class="form-grid"><div class="field col-8"><label>表格名称</label><input data-config="name" value="${esc(sheet.name)}"></div><div class="field col-4"><label>顺序编号</label><input type="number" data-config="orderNo" value="${Number(sheet.orderNo) || 0}"></div></div></section>
           <section class="card"><h2>列定义（第一列为内部行号）</h2><div class="columns">${header.slice(1).map((value, index) => `<div class="column-row"><span class="index">${index + 1}</span><input data-col="${index + 1}" value="${esc(value)}"><button class="minibtn danger" data-act="delete-col" data-col="${index + 1}">删除</button></div>`).join('')}</div><button class="minibtn" data-act="add-col" style="margin-top:8px">＋ 添加列</button></section>
@@ -1705,6 +1863,7 @@
           <section class="card injection-card"><div class="section-head"><div><h2>世界书注入</h2><p class="hint">主条目可整表写入，也可按数据行拆分；关键词既可以写固定词，也可以填写列名。</p></div><label class="check strong-check"><input type="checkbox" data-export="enabled" ${config.enabled ? 'checked' : ''}>启用此表注入</label></div>
             <div class="option-strip"><label class="check"><input type="checkbox" data-export="splitByRow" ${config.splitByRow ? 'checked' : ''}>每行单独条目</label><label class="check"><input type="checkbox" data-export="preventRecursion" ${config.preventRecursion ? 'checked' : ''}>防止递归</label></div>
             <div class="form-grid"><div class="field col-8"><label>条目名称</label><input data-export="entryName" value="${esc(config.entryName)}"></div><div class="field col-4"><label>条目类型</label><select data-export="entryType"><option value="constant" ${config.entryType === 'constant' ? 'selected' : ''}>常量</option><option value="keyword" ${config.entryType === 'keyword' ? 'selected' : ''}>关键词</option></select></div><div class="field wide"><label>关键词</label><input data-export="keywords" value="${esc(config.keywords)}" placeholder="逗号、中文逗号或换行分隔；填列名可读取该列"${keywordDisabled}><span class="field-note">关键词模式下，匹配列名时会从每行该列生成 keys；否则按固定关键词处理。</span></div><div class="field wide"><label>注入模板</label><textarea data-export="injectionTemplate" placeholder="$1 代表生成的 Markdown 表格">${esc(config.injectionTemplate)}</textarea></div><div class="field wide"><label>主条目位置</label>${placementHtml('entry', config.entryPlacement)}</div></div>
+            <div class="subpanel"><div class="section-head compact"><div><h3>相对剧情时间</h3><p class="hint">只改变同步到世界书的临时表格，不修改聊天 checkpoint 和原表数据。</p></div><label class="check"><input type="checkbox" data-export="relativeTimeEnabled" ${config.relativeTimeEnabled ? 'checked' : ''}>启用时间差</label></div><div class="form-grid"><div class="field col-6"><label>表格中的时间列</label><select data-export="relativeTimeColumn"${relativeDisabled}><option value="" ${config.relativeTimeColumn ? '' : 'selected'}>请选择列</option>${relativeColumnOptions}</select></div><div class="field col-6"><label>当前识别结果</label><input value="${esc(detectedStoryDate ? `${detectedStoryDate.label} · AI 第 ${detectedStoryDate.aiFloor} 层` : `最新及前 ${STORY_DATE_AI_LOOKBACK - 1} 个 AI 楼层未识别`)}" readonly></div></div><p class="hint" style="margin-top:8px">同步时先读最新 AI 楼层，找到日期就立即停止；只有没找到才逐层往前，最多再看 ${STORY_DATE_AI_LOOKBACK - 1} 层。识别以“【2025年9月19日”开头的日期，后面的标点、时间、地点不受限制；同一楼层取 &lt;content&gt; 后出现的最后一个。日期跨度取结束日期。</p></div>
             <div class="subpanel"><div class="section-head compact"><div><h3>额外索引条目</h3><p class="hint">从指定列生成一份更短的常量索引，可使用独立模板和注入位置。</p></div><label class="check"><input type="checkbox" data-export="extraIndexEnabled" ${config.extraIndexEnabled ? 'checked' : ''}>启用索引</label></div><div class="form-grid"><div class="field col-6"><label>索引条目名称</label><input data-export="extraIndexEntryName" value="${esc(config.extraIndexEntryName)}"${extraDisabled}></div><div class="field col-6"><label>索引列</label><input data-export="extraIndexColumns" value="${esc(config.extraIndexColumns.join('，'))}" placeholder="用逗号分隔现有列名"${extraDisabled}></div><div class="field wide"><label>索引注入模板</label><textarea data-export="extraIndexInjectionTemplate" placeholder="$1 代表索引表格"${extraDisabled}>${esc(config.extraIndexInjectionTemplate)}</textarea></div><div class="field wide"><label>索引条目位置</label>${placementHtml('extra', config.extraIndexPlacement, !config.extraIndexEnabled)}</div></div></div>
           </section>`;
     }
@@ -1983,7 +2142,7 @@
                     }
                     if (column === 1) {
                         const name = element.closest('.record-card')?.querySelector('.record-name');
-                        if (name) name.textContent = text(value).trim() || '未填写';
+                        if (name && name !== element) name.textContent = text(value).trim();
                     }
                     app.dirtyData = true;
                 }
@@ -2017,7 +2176,7 @@
             const sheet = app.data[app.active];
             if (element.dataset.export && sheet) {
                 updateExportField(sheet, element.dataset.export, element);
-                if (['entryType', 'extraIndexEnabled'].includes(element.dataset.export)) { render(); return; }
+                if (['entryType', 'extraIndexEnabled', 'relativeTimeEnabled'].includes(element.dataset.export)) { render(); return; }
             }
             if (element.dataset.place) updatePlacementField(sheet, element.dataset.place, element);
             refreshDirty();
