@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         数据库 V（可视化数据编辑精简版）
 // @namespace    http://tampermonkey.net/
-// @version      3.6.0
+// @version      3.6.1
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
 // @match        */*
@@ -1863,7 +1863,7 @@
           <section class="card injection-card"><div class="section-head"><div><h2>世界书注入</h2><p class="hint">主条目可整表写入，也可按数据行拆分；关键词既可以写固定词，也可以填写列名。</p></div><label class="check strong-check"><input type="checkbox" data-export="enabled" ${config.enabled ? 'checked' : ''}>启用此表注入</label></div>
             <div class="option-strip"><label class="check"><input type="checkbox" data-export="splitByRow" ${config.splitByRow ? 'checked' : ''}>每行单独条目</label><label class="check"><input type="checkbox" data-export="preventRecursion" ${config.preventRecursion ? 'checked' : ''}>防止递归</label></div>
             <div class="form-grid"><div class="field col-8"><label>条目名称</label><input data-export="entryName" value="${esc(config.entryName)}"></div><div class="field col-4"><label>条目类型</label><select data-export="entryType"><option value="constant" ${config.entryType === 'constant' ? 'selected' : ''}>常量</option><option value="keyword" ${config.entryType === 'keyword' ? 'selected' : ''}>关键词</option></select></div><div class="field wide"><label>关键词</label><input data-export="keywords" value="${esc(config.keywords)}" placeholder="逗号、中文逗号或换行分隔；填列名可读取该列"${keywordDisabled}><span class="field-note">关键词模式下，匹配列名时会从每行该列生成 keys；否则按固定关键词处理。</span></div><div class="field wide"><label>注入模板</label><textarea data-export="injectionTemplate" placeholder="$1 代表生成的 Markdown 表格">${esc(config.injectionTemplate)}</textarea></div><div class="field wide"><label>主条目位置</label>${placementHtml('entry', config.entryPlacement)}</div></div>
-            <div class="subpanel"><div class="section-head compact"><div><h3>相对剧情时间</h3><p class="hint">只改变同步到世界书的临时表格，不修改聊天 checkpoint 和原表数据。</p></div><label class="check"><input type="checkbox" data-export="relativeTimeEnabled" ${config.relativeTimeEnabled ? 'checked' : ''}>启用时间差</label></div><div class="form-grid"><div class="field col-6"><label>表格中的时间列</label><select data-export="relativeTimeColumn"${relativeDisabled}><option value="" ${config.relativeTimeColumn ? '' : 'selected'}>请选择列</option>${relativeColumnOptions}</select></div><div class="field col-6"><label>当前识别结果</label><input value="${esc(detectedStoryDate ? `${detectedStoryDate.label} · AI 第 ${detectedStoryDate.aiFloor} 层` : `最新及前 ${STORY_DATE_AI_LOOKBACK - 1} 个 AI 楼层未识别`)}" readonly></div></div><p class="hint" style="margin-top:8px">同步时先读最新 AI 楼层，找到日期就立即停止；只有没找到才逐层往前，最多再看 ${STORY_DATE_AI_LOOKBACK - 1} 层。识别以“【2025年9月19日”开头的日期，后面的标点、时间、地点不受限制；同一楼层取 &lt;content&gt; 后出现的最后一个。日期跨度取结束日期。</p></div>
+            <div class="subpanel"><div class="section-head compact"><div><h3>相对剧情时间</h3><p class="hint">只改变同步到世界书的临时表格，不修改聊天 checkpoint 和原表数据。</p></div><label class="check"><input type="checkbox" data-export="relativeTimeEnabled" ${config.relativeTimeEnabled ? 'checked' : ''}>启用时间差</label></div><div class="form-grid"><div class="field col-6"><label>表格中的时间列</label><select data-export="relativeTimeColumn"${relativeDisabled}><option value="" ${config.relativeTimeColumn ? '' : 'selected'}>请选择列</option>${relativeColumnOptions}</select></div><div class="field col-6"><label>当前识别结果</label><input value="${esc(detectedStoryDate ? `${detectedStoryDate.label} · AI 第 ${detectedStoryDate.aiFloor} 层` : `最新及前 ${STORY_DATE_AI_LOOKBACK - 1} 个 AI 楼层未识别`)}" readonly></div></div><p class="hint" style="margin-top:8px">同步时先读最新 AI 楼层，找到日期就立即停止；只有没找到才逐层往前，最多再看 ${STORY_DATE_AI_LOOKBACK - 1} 层。同一楼层取 &lt;content&gt; 后出现的最后一个。日期跨度取结束日期。</p></div>
             <div class="subpanel"><div class="section-head compact"><div><h3>额外索引条目</h3><p class="hint">从指定列生成一份更短的常量索引，可使用独立模板和注入位置。</p></div><label class="check"><input type="checkbox" data-export="extraIndexEnabled" ${config.extraIndexEnabled ? 'checked' : ''}>启用索引</label></div><div class="form-grid"><div class="field col-6"><label>索引条目名称</label><input data-export="extraIndexEntryName" value="${esc(config.extraIndexEntryName)}"${extraDisabled}></div><div class="field col-6"><label>索引列</label><input data-export="extraIndexColumns" value="${esc(config.extraIndexColumns.join('，'))}" placeholder="用逗号分隔现有列名"${extraDisabled}></div><div class="field wide"><label>索引注入模板</label><textarea data-export="extraIndexInjectionTemplate" placeholder="$1 代表索引表格"${extraDisabled}>${esc(config.extraIndexInjectionTemplate)}</textarea></div><div class="field wide"><label>索引条目位置</label>${placementHtml('extra', config.extraIndexPlacement, !config.extraIndexEnabled)}</div></div></div>
           </section>`;
     }
@@ -2176,7 +2176,13 @@
             const sheet = app.data[app.active];
             if (element.dataset.export && sheet) {
                 updateExportField(sheet, element.dataset.export, element);
-                if (['entryType', 'extraIndexEnabled', 'relativeTimeEnabled'].includes(element.dataset.export)) { render(); return; }
+                if (element.dataset.export === 'relativeTimeEnabled') {
+                    const timeColumn = root.querySelector('[data-export="relativeTimeColumn"]');
+                    if (timeColumn) timeColumn.disabled = !element.checked;
+                    refreshDirty();
+                    return;
+                }
+                if (['entryType', 'extraIndexEnabled'].includes(element.dataset.export)) { render(); return; }
             }
             if (element.dataset.place) updatePlacementField(sheet, element.dataset.place, element);
             refreshDirty();
