@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         数据库 V（可视化数据编辑精简版）
 // @namespace    http://tampermonkey.net/
-// @version      3.6.2
+// @version      3.6.4
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
 // @match        */*
@@ -11,11 +11,7 @@
 (function () {
     'use strict';
 
-    /*
-     * 这个文件刻意只保留三件事：现行聊天字段读写、完整 checkpoint 载入、
-     * 以及一个点击菜单后才创建的奶油风表格编辑器。
-     * 空字符串标签（""）是唯一工作槽位；其它槽位不会被触碰。
-    */
+    // 手动编辑 → 完整 checkpoint → 当前世界书临时条目；日常读写仅使用空标签槽。
     const PREFIX = 'shujuku_v120';
     const MINIMAL_INSTANCE_FLAG = '__ACU_STAR_DB_MINIMAL_VISUALIZER_LOADED__';
     const DATA_FIELD = 'TavernDB_ACU_IsolatedData';
@@ -33,7 +29,6 @@
     const STORY_DATE_AI_LOOKBACK = 5;
     const MANAGED_COMMENT_PREFIX = 'TavernDB-ACU-CustomExport-';
     const WORLD_BOOK_TARGET_KEY = `${PREFIX}_worldbook_target_v1`;
-    const WORLD_BOOK_ACTIVE_PROJECTION_KEY = `${PREFIX}_worldbook_active_projection_v2`;
     const UI_ACCENT_THEME_KEY = `${PREFIX}_ui_accent_theme_v1`;
     const IDB_OPEN_TIMEOUT_MS = 900;
     const MOBILE_DRAWER_SETTLE_MS = 180;
@@ -95,6 +90,7 @@
     const newSheetKey = () => `sheet_${Math.random().toString(36).slice(2, 11)}`;
     const newEntryId = () => `minimal_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
 
+    /* -------------------- 宿主与通知 -------------------- */
     function getHostWindow() {
         try {
             if (window.parent && window.parent !== window) {
@@ -136,6 +132,7 @@
         const c = context();
         if (typeof c.saveChat === 'function') await c.saveChat();
         else if (typeof HOST.saveChat === 'function') await HOST.saveChat();
+        else throw new Error('宿主没有提供聊天保存接口，本次未保存。');
     }
     function removeEditorNotices() {
         doc()?.getElementById(NOTICE_ID)?.remove();
@@ -204,7 +201,7 @@
         else console.log(`[数据库] ${message}`);
     }
 
-    /* 沿用原脚本的设置存储能力，只保存世界书目标和临时投影位置；没有默认表定义。 */
+    /* 只保存世界书目标和界面设置；没有默认表定义。 */
     let settingsNamespace = null;
     let settingsSave = null;
     let idbPromise = null;
@@ -328,16 +325,6 @@
     function managedProjectionPrefix(scopeKey = worldbookTargetScopeKey()) {
         return `${MANAGED_COMMENT_PREFIX}@${projectionScopeToken(scopeKey)}-`;
     }
-    async function readActiveWorldbookProjection() {
-        const parsed = parseJson(await settingGet(WORLD_BOOK_ACTIVE_PROJECTION_KEY), null);
-        if (!isObject(parsed) || !text(parsed.book).trim() || !text(parsed.scopeKey).trim()) return null;
-        return { scopeKey: text(parsed.scopeKey), book: text(parsed.book) };
-    }
-    async function writeActiveWorldbookProjection(record = null) {
-        await settingSet(WORLD_BOOK_ACTIVE_PROJECTION_KEY, record && record.book && record.scopeKey
-            ? JSON.stringify({ scopeKey: text(record.scopeKey), book: text(record.book) })
-            : '');
-    }
 
     /* -------------------- 三个现行聊天字段 -------------------- */
     const firstMessage = () => isObject(chat()[0]) ? chat()[0] : null;
@@ -438,8 +425,7 @@
             });
         };
         restore(snapshot?.first, snapshot?.firstFields || []);
-        const sameChat = chat() === snapshot?.chat
-            && (!snapshot?.chatId || currentChatId() === snapshot.chatId);
+        const sameChat = sameChatSnapshot(snapshot);
         if (!sameChat || metadata() !== snapshot?.meta) return;
         restore(snapshot.meta, snapshot.metaFields || []);
         const patch = {};
@@ -471,30 +457,6 @@
                 message[DATA_FIELD] = JSON.stringify(container);
             }
         } else message[DATA_FIELD] = container;
-    }
-    function pageRows(rows, page = 0, reverse = false, pageSize = PAGE_SIZE) {
-        const source = Array.isArray(rows) ? rows : [];
-        const size = Math.max(1, Number(pageSize) || PAGE_SIZE);
-        const pageCount = Math.max(1, Math.ceil(source.length / size));
-        const safePage = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
-        const start = safePage * size;
-        const items = [];
-        for (let offset = 0; offset < size && start + offset < source.length; offset++) {
-            const displayIndex = start + offset;
-            const physicalIndex = reverse ? source.length - 1 - displayIndex : displayIndex;
-            items.push({ row: source[physicalIndex], physicalIndex });
-        }
-        return { page: safePage, pageCount, start, items };
-    }
-    function recordFieldSize(value, label = '') {
-        const source = `${text(label)} ${text(value)}`;
-        let weight = 0;
-        for (const char of source) {
-            if (char === '\n') weight += 12;
-            else if (/[^\u0000-\u00ff]/.test(char)) weight += 2;
-            else weight += 1;
-        }
-        return weight > 88 ? 'long' : (weight > 34 ? 'medium' : 'short');
     }
     function isV2Slot(slot) {
         return isObject(slot) && isObject(slot.storageFrame)
@@ -606,30 +568,16 @@
         const parsedData = parseJson(raw, null, false);
         const source = isObject(parsedData) ? parsedData : {};
         const data = { mate: { type: 'chatSheets', version: Number(source.mate?.version) || 1 } };
-        Object.keys(source).filter(isSheetKey).forEach(key => { data[key] = normalizeSheet(source[key], key, keepRows); });
+        Object.keys(source).filter(isSheetKey).forEach(key => {
+            const sheet = normalizeSheet(source[key], key, keepRows);
+            if (!BUILTIN_UIDS.has(key) && !BUILTIN_UIDS.has(sheet.uid)) data[key] = sheet;
+        });
         orderedKeys(data).forEach((key, index) => { data[key].orderNo = index; });
         return data;
     }
-    function removeBuiltinSheets(value, keepRows = true) {
-        const output = normalizeData(value, keepRows);
-        Object.keys(output).filter(isSheetKey).forEach(key => {
-            // 原版默认表都有稳定 UID；只按 UID 删除，避免误删用户自建的同名表。
-            if (BUILTIN_UIDS.has(output[key].uid) || BUILTIN_UIDS.has(key)) {
-                delete output[key];
-            }
-        });
-        orderedKeys(output).forEach((key, index) => { output[key].orderNo = index; });
-        return output;
-    }
-    function removeBuiltins(template) {
-        return removeBuiltinSheets(template, false);
-    }
-    function minimalDataForWrite(data, keepRows = true) {
-        // normalizeData 已经在入口白名单化；这里仅继续阻止原版默认表复活。
-        return removeBuiltinSheets(data, keepRows);
-    }
+
     function templateFromData(data) {
-        return minimalDataForWrite(data, false);
+        return normalizeData(data, false);
     }
     function templateOverview(data) {
         const keys = orderedKeys(data);
@@ -713,13 +661,7 @@
         }
         return { start, end, total };
     }
-    function aiFloorIndices(messages) {
-        const result = [];
-        (Array.isArray(messages) ? messages : []).forEach((message, index) => {
-            if (message && !message.is_user) result.push(index);
-        });
-        return result;
-    }
+
     function rememberDeletedProperty(changes, target, key) {
         if (!target || !Object.prototype.hasOwnProperty.call(target, key)) return false;
         let record = changes.find(item => item.target === target);
@@ -757,38 +699,34 @@
     }
     function removeAllKnownPluginData(messages, metadataObject = metadata()) {
         const changes = [];
-        const changedMessages = new Set();
+        let removed = 0;
+        const fields = [...LEGACY_MESSAGE_FIELDS, ...TEMPLATE_MESSAGE_FIELDS];
         let removedCharacters = 0;
         const first = Array.isArray(messages) ? messages[0] : null;
         // 卸载前先记住首楼证据；字段稍后会从消息中删除，不能再用删除后的
         // 首楼判断 ownerless metadata 是否属于当前聊天。
         const firstFieldEvidence = new Set(
-            [...LEGACY_MESSAGE_FIELDS, ...TEMPLATE_MESSAGE_FIELDS]
-                .filter(field => Object.prototype.hasOwnProperty.call(first || {}, field)),
+            fields.filter(field => Object.prototype.hasOwnProperty.call(first || {}, field)),
         );
         (Array.isArray(messages) ? messages : []).forEach(message => {
             if (!message) return;
             const before = jsonByteLength(message);
             let messageRemoved = false;
-            LEGACY_MESSAGE_FIELDS.forEach(key => {
+            fields.forEach(key => {
                 if (rememberDeletedProperty(changes, message, key)) messageRemoved = true;
             });
             const extraRemoved = removeLegacyExtraFields(message, changes);
             messageRemoved = messageRemoved || extraRemoved;
-            TEMPLATE_MESSAGE_FIELDS.forEach(key => {
-                if (rememberDeletedProperty(changes, message, key)) messageRemoved = true;
-            });
             const after = jsonByteLength(message);
             if (messageRemoved) {
-                changedMessages.add(message);
+                removed += 1;
                 removedCharacters += Math.max(0, before - after);
             }
         });
         const metadataChanges = [];
         const activeChatId = currentChatId();
         if (metadataObject && isObject(metadataObject)) {
-            [...LEGACY_MESSAGE_FIELDS, ...TEMPLATE_MESSAGE_FIELDS]
-                .flatMap(key => [key, `${key}__chatId`])
+            fields.flatMap(key => [key, `${key}__chatId`])
                 .forEach(key => {
                     if (!Object.prototype.hasOwnProperty.call(metadataObject, key)) return;
                     const field = key.endsWith('__chatId') ? key.slice(0, -'__chatId'.length) : key;
@@ -804,37 +742,28 @@
                 });
         }
         return {
-            removed: changedMessages.size,
+            removed,
             removedCharacters,
             changes,
             metadataObject,
             metadataChanges,
-            changed: changedMessages.size > 0 || metadataChanges.length > 0,
+            changed: removed > 0 || metadataChanges.length > 0,
         };
     }
-    function assertFrameDeletionReplayable(messages, selected) {
-        const survivors = [];
-        (Array.isArray(messages) ? messages : []).forEach((message, index) => {
-            if (!message || message.is_user || selected.has(index)) return;
-            const slot = isolatedContainer(message, false)[SLOT];
-            if (isV2Slot(slot)) survivors.push({ frame: slot.storageFrame, index });
-        });
+    function assertFrameDeletionReplayable(messages, range) {
+        const survivors = getFrameRefs(messages).filter(ref => ref.aiFloor < range.start || ref.aiFloor > range.end);
         if (!survivors.length) return;
-        let latestFullIndex = -1;
-        survivors.forEach((ref, index) => { if (hasUsableFullCheckpoint(ref.frame)) latestFullIndex = index; });
-        if (latestFullIndex < 0) {
-            throw new Error('清理后会只剩无法独立读取的旧增量记录。请扩大删除范围，或先用旧聊天兼容迁移版保存完整 checkpoint。');
-        }
-        if (survivors.slice(latestFullIndex).some(ref => frameHasReplayDelta(ref.frame))) {
-            throw new Error('清理后最新完整 checkpoint 之后仍有旧增量记录，推荐版将无法安全载入。请扩大删除范围，或先用旧聊天兼容迁移版保存完整 checkpoint。');
+        const base = [...survivors].reverse().find(ref => ref.frame.checkpoint?.kind === 'full');
+        if (!base || !hasUsableFullCheckpoint(base.frame)
+            || survivors.some(ref => ref.index >= base.index && frameHasReplayDelta(ref.frame))) {
+            throw new Error('删除后剩余记录无法由完整 checkpoint 独立载入，请检查删除范围。');
         }
     }
     function restoreMetadataChanges(result) {
         if (!result?.metadataObject) return;
         [...(result.metadataChanges || [])].reverse().forEach(({ key, value }) => { result.metadataObject[key] = value; });
     }
-    function removeStoredFramesInAiFloorRange(messages, startFloor, endFloor) {
-        const range = normalizeAiFloorRange(startFloor, endFloor, messages);
+    function removeStoredFramesInAiFloorRange(messages, range) {
         let aiFloor = 0;
         let removed = 0;
         let removedCharacters = 0;
@@ -855,17 +784,13 @@
         });
         return { ...range, removed, removedCharacters, changes };
     }
-    function assertFloorDeletionReplayable(messages, startFloor, endFloor) {
-        const range = normalizeAiFloorRange(startFloor, endFloor, messages);
-        const selected = new Set(aiFloorIndices(messages).slice(range.start - 1, range.end));
-        assertFrameDeletionReplayable(messages, selected);
-        return range;
-    }
+
     async function deleteStoredFramesByAiFloor(startFloor, endFloor, saveSession = null) {
         const messages = saveSession?.chat || chat();
         if (saveSession) assertSaveSession(saveSession);
-        assertFloorDeletionReplayable(messages, startFloor, endFloor);
-        const result = removeStoredFramesInAiFloorRange(messages, startFloor, endFloor);
+        const range = normalizeAiFloorRange(startFloor, endFloor, messages);
+        assertFrameDeletionReplayable(messages, range);
+        const result = removeStoredFramesInAiFloorRange(messages, range);
         if (!result.removed) return result;
         try {
             if (saveSession) assertSaveSession(saveSession);
@@ -950,7 +875,7 @@
                 kind: 'full',
                 createdAt: Date.now(),
                 reason,
-                data: saveSession ? data : minimalDataForWrite(data, true),
+                data: saveSession ? data : normalizeData(data, true),
             },
             logEntries: [],
         };
@@ -1035,19 +960,15 @@
         resolvedWorldbookTarget = worldbookTarget !== 'auto' ? worldbookTarget : (bound[0] || all[0] || '');
         return worldbookOptions;
     }
-    async function primaryBook() {
-        const names = await boundWorldbooks();
-        return names[0] || '';
-    }
+
     async function resolveTargetBook(scopeKey = worldbookTargetScopeKey()) {
-        const stored = await readWorldbookTarget(scopeKey);
-        const target = stored || worldbookTarget || 'auto';
+        const target = await readWorldbookTarget(scopeKey);
         worldbookTarget = target;
         if (target && target !== 'auto') {
             resolvedWorldbookTarget = target;
             return target;
         }
-        const primary = await primaryBook();
+        const [primary] = await boundWorldbooks();
         if (primary) {
             resolvedWorldbookTarget = primary;
             return primary;
@@ -1064,7 +985,7 @@
         if (!sameChatSnapshot(snapshot)) return;
         await resolveTargetBook(scopeKey);
         if (!sameChatSnapshot(snapshot)) return;
-        // 目标切换只移动世界书临时投影，不重新载入聊天模型；否则会把
+        // 目标切换只刷新目标书的临时投影，不重新载入聊天模型；否则会把
         // 当前编辑页、倒序状态和尚未保存的表格改动重置掉。
         projectionGeneration += 1;
         if (activeApp) {
@@ -1078,7 +999,7 @@
     async function readBookEntries(book) {
         const h = helper();
         try {
-            if (typeof h?.getLorebookEntries !== 'function') return [];
+            if (typeof h?.getLorebookEntries !== 'function') return null;
             const entries = await h.getLorebookEntries(book);
             return Array.isArray(entries) ? entries : null;
         } catch (_) { return null; }
@@ -1090,6 +1011,7 @@
         const rowLine = row => `| ${columns.map((_, index) => cell(row?.[index + 1])).join(' | ')} |`;
         return [`| ${columns.join(' | ')} |`, `|${columns.map(() => '---').join('|')}|`, ...rows.map(rowLine)].join('\n');
     }
+    /* -------------------- 相对剧情时间 -------------------- */
     function calendarDate(yearValue, monthValue, dayValue) {
         const year = Number(yearValue), month = Number(monthValue), day = Number(dayValue);
         if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)
@@ -1179,27 +1101,26 @@
         return `约${Math.round(days / 365)}年前`;
     }
     function relativeProjection(config, header, rows, anchorDate) {
-        if (!config.relativeTimeEnabled) return { applied: false, reason: 'disabled', header, rows };
-        if (!anchorDate) return { applied: false, reason: 'no-anchor', header, rows };
+        const unchanged = { applied: false, header, rows };
+        if (!config.relativeTimeEnabled || !anchorDate) return unchanged;
         const timeColumn = header.findIndex(value => text(value).trim() === text(config.relativeTimeColumn).trim());
-        if (timeColumn < 1) return { applied: false, reason: 'no-column', header, rows };
+        if (timeColumn < 1) return unchanged;
         const values = rows.map(row => relativeStoryTime(dateFromTableCell(row?.[timeColumn]), anchorDate));
-        if (!values.some(Boolean)) return { applied: false, reason: 'no-row-date', header, rows };
+        if (!values.some(Boolean)) return unchanged;
         const insertAt = timeColumn + 1;
         return {
             applied: true,
-            reason: '',
             header: [...header.slice(0, insertAt), '距当前剧情', ...header.slice(insertAt)],
             rows: rows.map((row, index) => [...row.slice(0, insertAt), values[index], ...row.slice(insertAt)]),
         };
     }
-    const keywordList = value => delimitedList(value);
+    /* -------------------- 世界书条目生成与同步 -------------------- */
     function resolveEntryKeys(config, header, rows) {
         const keys = [];
-        keywordList(config.keywords).forEach(token => {
+        delimitedList(config.keywords).forEach(token => {
             const column = header.findIndex(value => text(value).trim() === token);
             if (column > 0) {
-                rows.forEach(row => keys.push(...keywordList(row?.[column])));
+                rows.forEach(row => keys.push(...delimitedList(row?.[column])));
             } else {
                 keys.push(token);
             }
@@ -1212,6 +1133,15 @@
         if (config.position === 'at_depth_as_system') output.depth = config.depth;
         else delete output.depth;
         return output;
+    }
+    function relativeTimeNotice(relative) {
+        if (!relative?.enabledTables) return { message: '', kind: 'success' };
+        return {
+            message: relative.anchor
+                ? ` 剧情日期：${relative.anchor.label}（AI 第 ${relative.anchor.aiFloor} 层）；相对时间已用于 ${relative.appliedTables}/${relative.enabledTables} 张表。`
+                : ` 最新 AI 楼层及前 ${STORY_DATE_AI_LOOKBACK - 1} 层没有识别到“【2025年9月19日”格式，相对时间未生成。`,
+            kind: relative.appliedTables < relative.enabledTables ? 'warning' : 'success',
+        };
     }
     async function syncWorldbook(data, options = {}) {
         const silent = options.silent === true;
@@ -1231,39 +1161,10 @@
             return { ok: false, message };
         }
         const scopedPrefix = managedProjectionPrefix(projectionScopeKey);
-        const activeProjection = await readActiveWorldbookProjection();
-        let previousRemoved = 0;
-        const removeProjection = async record => {
-            if (!record?.book) return 0;
-            const entries = await readBookEntries(record.book);
-            if (!Array.isArray(entries)) throw new Error(`读取世界书「${record.book}」失败，已停止清理以避免误删。`);
-            const prefix = managedProjectionPrefix(record.scopeKey);
-            const ids = entries
-                // token 是归属校验；UID ledger 只作记录/诊断，不能因宿主返回
-                // 类型不同或 create 不返回 UID 而漏删本聊天自己的临时条目。
-                .filter(entry => text(entry?.comment).startsWith(prefix))
-                .map(entry => entry.uid).filter(value => value !== undefined);
-            if (!ids.length) return 0;
-            if (typeof h.deleteLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目删除接口');
-            await h.deleteLorebookEntries(record.book, ids);
-            return ids.length;
-        };
         const book = await resolveTargetBook(projectionScopeKey);
         if (!isFresh()) return { ok: false, stale: true };
-        // 世界书是“当前聊天”的临时投影：切换聊天/目标书时，只删除上一条
-        // 全局 active projection 的 UID 或带有其聊天 token 的注释，不再通配
-        // 同一本书里其它聊天的旧前缀条目。
-        if (activeProjection && (activeProjection.scopeKey !== projectionScopeKey || activeProjection.book !== book)) {
-            try { previousRemoved = await removeProjection(activeProjection); }
-            catch (error) {
-                if (!silent) notify(error.message || text(error), 'warning');
-                else console.warn('[数据库] 上一聊天世界书投影未清理：', error);
-                return { ok: false, message: error.message || text(error) };
-            }
-            await writeActiveWorldbookProjection(null);
-        }
         if (!book) {
-            const message = '当前角色没有可用世界书，已清理上一聊天的临时投影。';
+            const message = '当前没有可用的目标世界书，请在结构与注入中选择。';
             if (!silent) notify(message, 'warning');
             return { ok: false, message };
         }
@@ -1274,7 +1175,10 @@
             if (!silent) notify(message, 'warning');
             return { ok: false, message };
         }
-        const managed = existing.filter(entry => text(entry?.comment).startsWith(scopedPrefix));
+        const cleanupKey = JSON.stringify([projectionScopeKey, book]);
+        const needsCleanup = cleanedProjectionTarget !== cleanupKey;
+        // 切换后的首次同步检查所有本插件残留；后续只维护当前聊天条目。
+        const managed = existing.filter(entry => text(entry?.comment).startsWith(needsCleanup ? MANAGED_COMMENT_PREFIX : scopedPrefix));
         const candidates = [];
         const needsRelativeTime = orderedKeys(data).some(key => data[key].exportConfig?.enabled && data[key].exportConfig?.relativeTimeEnabled);
         const storyDate = needsRelativeTime ? latestStoryDate(chat()) : null;
@@ -1302,11 +1206,9 @@
             const projected = relativeProjection(config, header, rows, storyDate);
             if (config.relativeTimeEnabled) {
                 relativeTime.enabledTables += 1;
-                if (projected.applied) {
-                    relativeTime.appliedTables += 1;
-                }
+                if (projected.applied) relativeTime.appliedTables += 1;
             }
-            const projectedRows = new Map(rows.map((row, index) => [row, projected.rows[index]]));
+            const projectedRows = projected.applied ? new Map(rows.map((row, index) => [row, projected.rows[index]])) : null;
             const render = selectedRows => {
                 const outputRows = projected.applied
                     ? selectedRows.map(row => projectedRows.get(row) || row)
@@ -1358,61 +1260,41 @@
             prevent_recursion: candidate.preventRecursion,
         }, candidate.placementConfig));
         const byComment = new Map();
-        managed.forEach(entry => {
-            const comment = text(entry.comment);
-            if (!byComment.has(comment)) byComment.set(comment, []);
-            byComment.get(comment).push(entry);
+        if (!needsCleanup) managed.forEach(entry => {
+            const matches = byComment.get(entry.comment) || [];
+            matches.push(entry);
+            byComment.set(entry.comment, matches);
         });
-        const updates = [];
-        const creates = [];
+        if (managed.some(entry => entry.uid === undefined || entry.uid === null)) {
+            const message = '临时条目缺少 UID，暂不同步，请刷新世界书后重试。';
+            if (!silent) notify(message, 'warning');
+            return { ok: false, message };
+        }
+        const updates = [], creates = [];
         desired.forEach(next => {
-            const matches = byComment.get(next.comment);
-            const old = matches?.shift();
-            if (old?.uid !== undefined) updates.push({ ...next, uid: old.uid });
+            const previous = byComment.get(next.comment)?.shift();
+            if (previous?.uid !== undefined && previous.uid !== null) updates.push({ ...next, uid: previous.uid });
             else creates.push(next);
         });
-        const staleIds = [...byComment.values()].flat()
-            .map(entry => entry.uid).filter(value => value !== undefined);
-        const rememberCurrentProjection = async () => {
-            try {
-                await writeActiveWorldbookProjection({ scopeKey: projectionScopeKey, book });
-            } catch (error) { console.warn('[数据库] 记录世界书投影位置失败：', error); }
-        };
+        const staleIds = (needsCleanup ? managed : [...byComment.values()].flat()).map(entry => entry.uid);
         try {
+            // 先验证所需接口，避免缺少新增接口时先删掉旧临时条目。
+            if (staleIds.length && typeof h.deleteLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目删除接口');
+            if (creates.length && typeof h.createLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目新增接口');
+            if (updates.length && typeof h.setLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目更新接口');
             if (!isFresh()) return { ok: false, stale: true };
-            if (updates.length) {
-                if (typeof h.setLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目更新接口');
-                await h.setLorebookEntries(book, updates);
-                await rememberCurrentProjection();
-            }
+            if (staleIds.length) await h.deleteLorebookEntries(book, staleIds);
             if (!isFresh()) return { ok: false, stale: true };
-            if (creates.length) {
-                if (typeof h.createLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目新增接口');
-                await h.createLorebookEntries(book, creates);
-                await rememberCurrentProjection();
-            }
+            if (updates.length) await h.setLorebookEntries(book, updates);
             if (!isFresh()) return { ok: false, stale: true };
-            if (staleIds.length) {
-                if (typeof h.deleteLorebookEntries !== 'function') throw new Error('宿主缺少世界书条目删除接口');
-                await h.deleteLorebookEntries(book, staleIds);
-                await rememberCurrentProjection();
-            }
+            if (creates.length) await h.createLorebookEntries(book, creates);
             if (!isFresh()) return { ok: false, stale: true };
-            if (desired.length) await rememberCurrentProjection();
-            else await writeActiveWorldbookProjection(null);
+            cleanedProjectionTarget = cleanupKey;
             if (!silent) {
-                let relativeMessage = '';
-                let tone = 'success';
-                if (relativeTime.enabledTables && !storyDate) {
-                    relativeMessage = ` 最新 AI 楼层及前 ${STORY_DATE_AI_LOOKBACK - 1} 层没有识别到“【2025年9月19日”格式，相对时间未生成。`;
-                    tone = 'warning';
-                } else if (relativeTime.enabledTables) {
-                    relativeMessage = ` 剧情日期：${storyDate.label}（AI 第 ${storyDate.aiFloor} 层）；相对时间已用于 ${relativeTime.appliedTables}/${relativeTime.enabledTables} 张表。`;
-                    if (relativeTime.appliedTables < relativeTime.enabledTables) tone = 'warning';
-                }
-                notify(`世界书已同步：更新 ${updates.length} 条，新增 ${creates.length} 条，清理旧条目 ${staleIds.length + previousRemoved} 条。${relativeMessage}`, tone);
+                const notice = relativeTimeNotice(relativeTime);
+                notify(`世界书「${book}」已同步：更新 ${updates.length} 条，新增 ${creates.length} 条，清理临时条目 ${staleIds.length} 条。${notice.message}`, notice.kind);
             }
-            return { ok: true, updated: updates.length, created: creates.length, removed: staleIds.length + previousRemoved, relativeTime };
+            return { ok: true, updated: updates.length, created: creates.length, removed: staleIds.length, relativeTime };
         } catch (error) {
             if (!silent) notify(`世界书同步失败：${error?.message || error}`, 'error');
             else console.warn('[数据库] 自动同步世界书失败：', error);
@@ -1423,7 +1305,6 @@
     /* -------------------- 编辑器模型与保存 -------------------- */
     let app = null;
     let settingsReady = false;
-    let uiAccentThemeReady = false;
     let uiAccentTheme = 'blue';
     let listenerAttached = false;
     let saveInProgress = false;
@@ -1433,54 +1314,16 @@
     let projectionRunning = false;
     let projectionRequested = false;
     let worldbookQueue = Promise.resolve();
+    let cleanedProjectionTarget = null;
     let scrollLockSnapshot = null;
     let viewportListenerAttached = false;
 
-    function lockHostScroll() {
-        const document = doc();
-        if (!document?.body || scrollLockSnapshot) return;
-        const html = document.documentElement;
-        scrollLockSnapshot = {
-            bodyOverflow: document.body.style.overflow,
-            htmlOverflow: html?.style.overflow || '',
-        };
-        document.body.style.overflow = 'hidden';
-        if (html) html.style.overflow = 'hidden';
-    }
-    function unlockHostScroll() {
-        const document = doc();
-        if (!document?.body || !scrollLockSnapshot) return;
-        document.body.style.overflow = scrollLockSnapshot.bodyOverflow;
-        if (document.documentElement) document.documentElement.style.overflow = scrollLockSnapshot.htmlOverflow;
-        scrollLockSnapshot = null;
-    }
-    function viewportWidth() {
-        const candidates = [
-            HOST.visualViewport?.width,
-            HOST.innerWidth,
-            HOST.document?.documentElement?.clientWidth,
-            HOST.screen?.width,
-        ].map(Number).filter(value => Number.isFinite(value) && value > 0);
-        return candidates.length ? Math.min(...candidates) : 1024;
-    }
-    function markViewport(root) {
-        if (!root) return;
-        const width = viewportWidth();
-        root.dataset.layout = width <= 720 ? 'mobile' : (width <= 980 ? 'tablet' : 'desktop');
-        if (viewportListenerAttached) return;
-        viewportListenerAttached = true;
-        const refresh = () => {
-            const current = doc().getElementById(ROOT_ID);
-            if (current) markViewport(current);
-        };
-        try { HOST.addEventListener?.('resize', refresh, { passive: true }); } catch (_) { /* optional */ }
-        try { HOST.visualViewport?.addEventListener?.('resize', refresh, { passive: true }); } catch (_) { /* optional */ }
-    }
-
     function queueWorldbookSync(data, options = {}) {
-        const task = worldbookQueue
-            .catch(() => {})
-            .then(() => syncWorldbook(data, options));
+        const snapshot = { chat: chat(), chatId: currentChatId() };
+        const isFresh = () => sameChatSnapshot(snapshot) && (!options.isFresh || options.isFresh());
+        const task = worldbookQueue.then(() => isFresh()
+            ? syncWorldbook(data, { ...options, isFresh })
+            : { ok: false, stale: true });
         worldbookQueue = task.catch(() => {});
         return task;
     }
@@ -1490,14 +1333,13 @@
             app,
             chat: chat(),
             chatId: currentChatId(),
-            data: minimalDataForWrite(app.data, true),
+            data: normalizeData(app.data, true),
             customSaveEnabled: app.customSaveEnabled,
             saveFloor: app.saveFloor,
         };
     }
     function assertSaveSession(session) {
-        const sameId = !session.chatId || currentChatId() === session.chatId;
-        if (app !== session.app || chat() !== session.chat || !sameId) {
+        if (app !== session.app || !sameChatSnapshot(session)) {
             throw new Error('保存期间聊天已切换；已停止后续写入，请在新聊天中重新打开编辑器。');
         }
     }
@@ -1519,10 +1361,10 @@
         }
     }
     async function resolveModel() {
-        if (!settingsReady) { await initSettings(); settingsReady = true; }
-        if (!uiAccentThemeReady) {
+        if (!settingsReady) {
+            await initSettings();
             uiAccentTheme = normalizeUiAccentTheme(await settingGet(UI_ACCENT_THEME_KEY));
-            uiAccentThemeReady = true;
+            settingsReady = true;
         }
         const guide = currentGuide();
         const messages = chat();
@@ -1532,13 +1374,12 @@
             throw new Error('当前聊天存在 V2 数据，但没有可读取的完整 checkpoint。为避免覆盖旧数据，推荐版已停止载入。');
         }
         const source = restored || currentScopedTemplate() || guide;
-        return { data: removeBuiltinSheets(source, !!restored) };
+        return { data: normalizeData(source, !!restored) };
     }
     function createAppModel(resolved) {
-        const data = resolved.data;
         return {
-            data,
-            active: orderedKeys(data)[0] || null,
+            data: resolved.data,
+            active: orderedKeys(resolved.data)[0] || null,
             mode: 'data',
             dirtyData: false,
             dirtyTemplate: false,
@@ -1616,14 +1457,13 @@
         return { ...info, rows, tables: orderedKeys(app.data).length };
     }
     function writeCurrentTemplateFields(template) {
-        const guideData = template;
         const oldGuide = readField(GUIDE_FIELD);
         const guideContainer = { version: 2, tags: {} };
         if (isObject(oldGuide?.tags)) Object.entries(oldGuide.tags).forEach(([slot, value]) => {
             if (slot !== SLOT) guideContainer.tags[slot] = clone(value);
         });
         guideContainer.tags[SLOT] = {
-            data: guideData,
+            data: template,
             updatedAt: Date.now(),
             reason: 'minimal_editor',
             templateScopeMode: 'chat_override',
@@ -1638,8 +1478,8 @@
         scopeContainer.template[SLOT] = {
             mode: 'chat_override',
             isolationKey: SLOT,
-            templateStr: JSON.stringify(guideData),
-            guideData,
+            templateStr: JSON.stringify(template),
+            guideData: template,
             updatedAt: Date.now(),
             source: 'minimal_editor',
             reason: 'minimal_editor',
@@ -1648,41 +1488,29 @@
         // 现行 Guide + Scope 已写好后，旧 TableHeaderGuide 只会造成重复体积。
         writeField(LEGACY_TEMPLATE_FIELD, {});
     }
-    async function saveTemplate(session = null) {
-        const targetApp = session?.app || app;
-        if (session) assertSaveSession(session);
-        const value = templateFromData(session?.data || targetApp.data);
+    async function saveTemplate(session = createSaveSession()) {
+        assertSaveSession(session);
         const snapshot = snapshotTemplateFields();
         try {
-            writeCurrentTemplateFields(value);
+            writeCurrentTemplateFields(templateFromData(session.data));
             await saveChat();
+            assertSaveSession(session);
         } catch (error) {
             restoreTemplateFields(snapshot);
             throw error;
         }
-        if (session) assertSaveSession(session);
-        // 结构/世界书设置在点击保存后立即刷新当前聊天的临时投影。
-        const projection = await queueWorldbookSync(session?.data || targetApp.data, {
+        const projection = await queueWorldbookSync(session.data, {
             silent: true,
-            isFresh: session
-                ? () => app === session.app && chat() === session.chat
-                    && (!session.chatId || currentChatId() === session.chatId)
-                : undefined,
+            isFresh: () => app === session.app && sameChatSnapshot(session),
         });
-        if (session) assertSaveSession(session);
-        targetApp.dirtyTemplate = false;
-        const relative = projection?.relativeTime;
-        const relativeMessage = relative?.enabledTables
-            ? relative.anchor
-                ? ` 剧情日期：${relative.anchor.label}（AI 第 ${relative.anchor.aiFloor} 层）；相对时间已用于 ${relative.appliedTables}/${relative.enabledTables} 张表。`
-                : ` 最新 AI 楼层及前 ${STORY_DATE_AI_LOOKBACK - 1} 层没有识别到“【2025年9月19日”格式，相对时间未生成。`
-            : '';
-        const projectionFailed = projection?.ok === false && !projection.stale;
-        const relativeIncomplete = relative?.enabledTables && relative.appliedTables < relative.enabledTables;
-        notify(projectionFailed
-            ? `模板已保存，但世界书未同步：${projection.message || '接口不可用'}`
-            : `已保存到当前聊天模板并同步世界书。${relativeMessage}`, projectionFailed || relativeIncomplete ? 'warning' : 'success');
+        assertSaveSession(session);
+        session.app.dirtyTemplate = false;
+        const notice = relativeTimeNotice(projection.relativeTime);
+        notify(projection.ok
+            ? `已保存到当前聊天模板并同步世界书。${notice.message}`
+            : `模板已保存，但世界书未同步：${projection.message || '聊天已切换'}`, projection.ok ? notice.kind : 'warning');
     }
+
     async function saveData(session = null) {
         const activeSession = session || createSaveSession();
         assertSaveSession(activeSession);
@@ -1713,14 +1541,80 @@
         if (await saveData(session) === false) return;
         assertSaveSession(session);
         await queueWorldbookSync(session.data, {
-            isFresh: () => app === session.app && chat() === session.chat
-                && (!session.chatId || currentChatId() === session.chatId),
+            isFresh: () => app === session.app && sameChatSnapshot(session),
         });
         assertSaveSession(session);
         render();
     }
 
-    /* -------------------- 单一奶油风界面 -------------------- */
+    /* -------------------- 界面布局与样式 -------------------- */
+    function lockHostScroll() {
+        const document = doc();
+        if (!document?.body || scrollLockSnapshot) return;
+        const html = document.documentElement;
+        scrollLockSnapshot = {
+            bodyOverflow: document.body.style.overflow,
+            htmlOverflow: html?.style.overflow || '',
+        };
+        document.body.style.overflow = 'hidden';
+        if (html) html.style.overflow = 'hidden';
+    }
+    function unlockHostScroll() {
+        const document = doc();
+        if (!document?.body || !scrollLockSnapshot) return;
+        document.body.style.overflow = scrollLockSnapshot.bodyOverflow;
+        if (document.documentElement) document.documentElement.style.overflow = scrollLockSnapshot.htmlOverflow;
+        scrollLockSnapshot = null;
+    }
+    function viewportWidth() {
+        const candidates = [
+            HOST.visualViewport?.width,
+            HOST.innerWidth,
+            HOST.document?.documentElement?.clientWidth,
+            HOST.screen?.width,
+        ].map(Number).filter(value => Number.isFinite(value) && value > 0);
+        return candidates.length ? Math.min(...candidates) : 1024;
+    }
+    function markViewport(root) {
+        if (!root) return;
+        const width = viewportWidth();
+        root.dataset.layout = width <= 720 ? 'mobile' : 'desktop';
+        if (viewportListenerAttached) return;
+        viewportListenerAttached = true;
+        const refresh = () => {
+            const current = doc().getElementById(ROOT_ID);
+            if (current) markViewport(current);
+        };
+        try { HOST.addEventListener?.('resize', refresh, { passive: true }); } catch (_) { /* optional */ }
+        try { HOST.visualViewport?.addEventListener?.('resize', refresh, { passive: true }); } catch (_) { /* optional */ }
+    }
+
+    function pageRows(rows, page = 0, reverse = false, pageSize = PAGE_SIZE) {
+        const source = Array.isArray(rows) ? rows : [];
+        const size = Math.max(1, Number(pageSize) || PAGE_SIZE);
+        const pageCount = Math.max(1, Math.ceil(source.length / size));
+        const safePage = Math.max(0, Math.min(Number(page) || 0, pageCount - 1));
+        const start = safePage * size;
+        const items = [];
+        for (let offset = 0; offset < size && start + offset < source.length; offset++) {
+            const displayIndex = start + offset;
+            const physicalIndex = reverse ? source.length - 1 - displayIndex : displayIndex;
+            items.push({ row: source[physicalIndex], physicalIndex });
+        }
+        return { page: safePage, pageCount, items };
+    }
+    function recordFieldSize(value, label = '') {
+        const source = `${text(label)} ${text(value)}`;
+        let weight = 0;
+        for (const char of source) {
+            if (char === '\n') weight += 12;
+            else if (/[^\u0000-\u00ff]/.test(char)) weight += 2;
+            else weight += 1;
+            if (weight > 88) return 'long';
+        }
+        return weight > 34 ? 'medium' : 'short';
+    }
+
     const CSS = `
 #${ROOT_ID} [hidden]{display:none!important}
 #${ROOT_ID} .manage-head{position:relative;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}#${ROOT_ID} .manage-head h2{margin:0}#${ROOT_ID} .manage-head:last-child{margin-bottom:0}#${ROOT_ID} .manage-delete{margin-left:auto!important}#${ROOT_ID} .manage-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-top:14px}#${ROOT_ID} .manage-actions .btn,#${ROOT_ID} .manage-head .btn{position:static;float:none;transform:none;margin-top:0;margin-bottom:0;white-space:normal;height:auto;flex-shrink:0}#${ROOT_ID} .inline-help summary{display:flex;align-items:center;justify-content:center;width:22px;height:22px;border:1px solid var(--muted);border-radius:50%;cursor:pointer;color:var(--muted);font:italic 14px Georgia,serif;list-style:none}#${ROOT_ID} .inline-help summary::-webkit-details-marker{display:none}#${ROOT_ID} .inline-help[open] summary{color:var(--accent);border-color:var(--accent)}#${ROOT_ID} .inline-help p{position:absolute;z-index:5;left:0;right:0;top:100%;margin:6px 0 0;padding:12px;border:1px solid var(--line);border-radius:4px;background:var(--paper);box-shadow:0 5px 16px #0002}#${ROOT_ID} #acu-save-floor-field{margin-top:10px}
@@ -1743,7 +1637,7 @@
 #${ROOT_ID}[data-layout="mobile"] .mask{padding:0;align-items:stretch}#${ROOT_ID}[data-layout="mobile"] .win{width:100%;max-width:none;height:100vh;height:100dvh;max-height:none;border-radius:0;border-left:0;border-right:0}#${ROOT_ID}[data-layout="mobile"] .body{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}#${ROOT_ID}[data-layout="mobile"] .side{width:100%;height:auto;min-height:46px;max-height:94px;padding:5px 8px;display:flex;flex-direction:row;border-right:0;border-bottom:1px solid var(--line)}#${ROOT_ID}[data-layout="mobile"] #acu-sheet-list{flex-direction:row;overflow-x:auto;overflow-y:hidden}#${ROOT_ID}[data-layout="mobile"] .sheet{width:auto;flex:0 0 auto}#${ROOT_ID}[data-layout="mobile"] .side-actions{display:flex;margin:0}#${ROOT_ID}[data-layout="mobile"] .tabs{overflow-x:auto;white-space:nowrap;padding-left:6px;padding-right:6px}#${ROOT_ID}[data-layout="mobile"] .content{padding:10px}#${ROOT_ID}[data-layout="mobile"] .foot{padding-bottom:calc(7px + env(safe-area-inset-bottom,0px))}
 #${ROOT_ID}[data-layout="mobile"] .form-grid .col-4,#${ROOT_ID}[data-layout="mobile"] .form-grid .col-6,#${ROOT_ID}[data-layout="mobile"] .form-grid .col-8{grid-column:1/-1}#${ROOT_ID}[data-layout="mobile"] .placement-grid{grid-template-columns:1fr 1fr}#${ROOT_ID}[data-layout="mobile"] .placement-position{grid-column:1/-1}#${ROOT_ID}[data-layout="mobile"] .target-row{grid-template-columns:1fr}#${ROOT_ID}[data-layout="mobile"] .target-row .minibtn{justify-self:start}
 @media(max-width:520px){#${ROOT_ID} .placement-grid{grid-template-columns:1fr 1fr}#${ROOT_ID} .placement-position{grid-column:1/-1}#${ROOT_ID} .target-row{grid-template-columns:1fr}#${ROOT_ID} .target-row .minibtn{justify-self:start}#${ROOT_ID} .section-head{gap:10px}#${ROOT_ID} .option-strip{gap:10px}}
-@media(max-width:420px){#${ROOT_ID} .head .sub:not(.chat-id){display:none}#${ROOT_ID} .head .chat-id{max-width:125px}#${ROOT_ID} .side-title{max-width:68px}#${ROOT_ID} .side-actions button{font-size:10.5px;padding-left:6px;padding-right:6px}#${ROOT_ID} .tab{padding-left:12px;padding-right:12px}#${ROOT_ID} .content{padding:8px}#${ROOT_ID} .card{padding:10px}#${ROOT_ID} .empty{padding:24px 12px}}
+@media(max-width:420px){#${ROOT_ID} .head .chat-id{max-width:125px}#${ROOT_ID} .side-title{max-width:68px}#${ROOT_ID} .side-actions button{font-size:10.5px;padding-left:6px;padding-right:6px}#${ROOT_ID} .tab{padding-left:12px;padding-right:12px}#${ROOT_ID} .content{padding:8px}#${ROOT_ID} .card{padding:10px}#${ROOT_ID} .empty{padding:24px 12px}}
 @media(max-height:560px) and (max-width:720px){#${ROOT_ID} .head{height:40px}#${ROOT_ID} .iconbtn{min-height:32px}#${ROOT_ID} .side{min-height:40px;max-height:70px}#${ROOT_ID} .sheet{min-height:30px;padding:5px 8px}#${ROOT_ID} .tabs .tab{height:37px}#${ROOT_ID} .content{padding:7px}#${ROOT_ID} .foot{padding-top:5px;padding-bottom:5px}}
 `;
     // This layer is a sibling of the editor root, so it is intentionally not
@@ -1795,24 +1689,24 @@
     }
     async function toggleUiAccentTheme(root) {
         uiAccentTheme = uiAccentTheme === 'blue' ? 'green' : 'blue';
-        uiAccentThemeReady = true;
         applyUiAccentTheme(root);
         await settingSet(UI_ACCENT_THEME_KEY, uiAccentTheme);
     }
+    /* -------------------- 页面渲染 -------------------- */
     function render() {
         if (!app) return;
         const root = doc().getElementById(ROOT_ID);
         if (!root) return;
         markViewport(root);
-        applyUiAccentTheme(root);
         const keys = orderedKeys(app.data);
         if (!app.active || !app.data[app.active]) app.active = keys[0] || null;
         root.innerHTML = `<div class="mask"><section class="win" role="dialog" aria-modal="true" aria-label="数据库编辑器">
-          <header class="head"><h1>数据库</h1><span class="spacer"></span><span class="sub chat-id">${esc(currentChatId() || '未连接聊天')}</span><button class="iconbtn theme-toggle" data-act="toggle-theme" aria-pressed="${uiAccentTheme === 'green' ? 'true' : 'false'}" aria-label="${uiAccentTheme === 'blue' ? '切换为绿色' : '切换为蓝色'}" title="${uiAccentTheme === 'blue' ? '切换为绿色' : '切换为蓝色'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.5c-5.24 0-9.5 3.83-9.5 8.55 0 3.86 3.14 7 7 7h1.12c.62 0 1-.67.69-1.21-.62-1.08.16-2.43 1.4-2.43h3.42c2.97 0 5.37-2.4 5.37-5.37C21.5 5.43 17.24 2.5 12 2.5Z"/><circle cx="7" cy="10.4" r="1.15" fill="var(--paper)"/><circle cx="9.3" cy="6.8" r="1.15" fill="var(--paper)"/><circle cx="13.5" cy="6.3" r="1.15" fill="var(--paper)"/><circle cx="17.1" cy="8.6" r="1.15" fill="var(--paper)"/></svg></button><button class="iconbtn" data-act="close" aria-label="关闭">×</button></header>
+          <header class="head"><h1>数据库</h1><span class="spacer"></span><span class="sub chat-id">${esc(currentChatId() || '未连接聊天')}</span><button class="iconbtn theme-toggle" data-act="toggle-theme" ><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.5c-5.24 0-9.5 3.83-9.5 8.55 0 3.86 3.14 7 7 7h1.12c.62 0 1-.67.69-1.21-.62-1.08.16-2.43 1.4-2.43h3.42c2.97 0 5.37-2.4 5.37-5.37C21.5 5.43 17.24 2.5 12 2.5Z"/><circle cx="7" cy="10.4" r="1.15" fill="var(--paper)"/><circle cx="9.3" cy="6.8" r="1.15" fill="var(--paper)"/><circle cx="13.5" cy="6.3" r="1.15" fill="var(--paper)"/><circle cx="17.1" cy="8.6" r="1.15" fill="var(--paper)"/></svg></button><button class="iconbtn" data-act="close" aria-label="关闭">×</button></header>
           <div class="body"><aside class="side" aria-label="表格选择"><div class="side-title">当前表格 · ${keys.length}</div><div id="acu-sheet-list"></div><div class="side-actions"><button class="minibtn" data-act="add-sheet">＋ 新表</button><button class="minibtn" data-act="delete-sheet">删除表</button></div></aside>
           <div class="main"><nav class="tabs" aria-label="编辑器页面"><button class="tab ${app.mode === 'data' ? 'active' : ''}" data-mode="data">数据</button><button class="tab ${app.mode === 'config' ? 'active' : ''}" data-mode="config">结构与注入</button><button class="tab ${app.mode === 'template' ? 'active' : ''}" data-mode="template">模板</button><button class="tab ${app.mode === 'status' ? 'active' : ''}" data-mode="status">状态</button><button class="tab ${app.mode === 'backup' ? 'active' : ''}" data-mode="backup">数据管理</button></nav><main class="content" id="acu-content"></main></div></div>
           <footer class="foot"><span class="dirty">${app.dirtyData || app.dirtyTemplate ? '有未保存修改' : '已保存'}</span><span class="grow"></span><button class="btn" data-act="save-all">${esc(saveButtonLabel())}</button></footer>
         </section></div>`;
+        applyUiAccentTheme(root);
         const list = root.querySelector('#acu-sheet-list');
         keys.forEach(key => {
             const item = doc().createElement('div');
@@ -1875,7 +1769,7 @@
         element.innerHTML = `<div class="toolbar"><strong>结构与世界书注入</strong><span class="grow"></span><button class="btn secondary" data-act="save-template-chat">保存结构并同步世界书</button></div>
           <section class="card"><h2>基本信息</h2><div class="form-grid"><div class="field col-8"><label>表格名称</label><input data-config="name" value="${esc(sheet.name)}"></div><div class="field col-4"><label>顺序编号</label><input type="number" data-config="orderNo" value="${Number(sheet.orderNo) || 0}"></div></div></section>
           <section class="card"><h2>列定义（第一列为内部行号）</h2><div class="columns">${header.slice(1).map((value, index) => `<div class="column-row"><span class="index">${index + 1}</span><input data-col="${index + 1}" value="${esc(value)}"><button class="minibtn danger" data-act="delete-col" data-col="${index + 1}">删除</button></div>`).join('')}</div><button class="minibtn" data-act="add-col" style="margin-top:8px">＋ 添加列</button></section>
-          <section class="card"><h2>注入目标世界书</h2><div class="target-row"><div class="field"><label>按聊天记忆，当前聊天的所有表共用</label><select id="acu-worldbook-target">${worldbookTargetOptionsHtml()}</select></div><button class="minibtn" data-act="refresh-worldbooks">刷新列表</button></div><p class="hint">当前目标：${esc(resolvedWorldbookTarget || '未找到可用世界书')}。切换后会移动当前聊天的临时投影，并只清理本插件带当前聊天标记的条目。</p></section>
+<section class="card"><h2>注入目标世界书</h2><div class="target-row"><div class="field"><label>按聊天记忆，当前聊天的所有表共用</label><select id="acu-worldbook-target">${worldbookTargetOptionsHtml()}</select></div><button class="minibtn" data-act="refresh-worldbooks">刷新列表</button></div><p class="hint">当前目标：${esc(resolvedWorldbookTarget || '未找到可用世界书')}。切换聊天或目标书后检查一次本插件的临时表格残留；后续保存只更新当前聊天条目。其他世界书不作处理。</p></section>
           <section class="card injection-card"><div class="section-head"><div><h2>世界书注入</h2><p class="hint">主条目可整表写入，也可按数据行拆分；关键词既可以写固定词，也可以填写列名。</p></div><label class="check strong-check"><input type="checkbox" data-export="enabled" ${config.enabled ? 'checked' : ''}>启用此表注入</label></div>
             <div class="option-strip"><label class="check"><input type="checkbox" data-export="splitByRow" ${config.splitByRow ? 'checked' : ''}>每行单独条目</label><label class="check"><input type="checkbox" data-export="preventRecursion" ${config.preventRecursion ? 'checked' : ''}>防止递归</label></div>
             <div class="form-grid"><div class="field col-8"><label>条目名称</label><input data-export="entryName" value="${esc(config.entryName)}"></div><div class="field col-4"><label>条目类型</label><select data-export="entryType"><option value="constant" ${config.entryType === 'constant' ? 'selected' : ''}>常量</option><option value="keyword" ${config.entryType === 'keyword' ? 'selected' : ''}>关键词</option></select></div><div class="field wide"><label>关键词</label><input data-export="keywords" value="${esc(config.keywords)}" placeholder="逗号、中文逗号或换行分隔；填列名可读取该列"${keywordDisabled}><span class="field-note">关键词模式下，匹配列名时会从每行该列生成 keys；否则按固定关键词处理。</span></div><div class="field wide"><label>注入模板</label><textarea data-export="injectionTemplate" placeholder="$1 代表生成的 Markdown 表格">${esc(config.injectionTemplate)}</textarea></div><div class="field wide"><label>主条目位置</label>${placementHtml('entry', config.entryPlacement)}</div></div>
@@ -1931,7 +1825,7 @@
             template: templateFromData(app.data),
             // 备份也只导出当前精简版白名单，避免把旧 SQL/自动填表字段、
             // 外部索引状态或原版内置表再次带回聊天。
-            data: minimalDataForWrite(app.data, true),
+            data: normalizeData(app.data, true),
         };
     }
     function download(filename, value) {
@@ -1943,6 +1837,7 @@
         setTimeout(() => URL.revokeObjectURL(anchor.href), 1000);
     }
 
+    /* -------------------- 编辑、导入与事件处理 -------------------- */
     function applyTemplateToCurrentData(template) {
         const output = normalizeData(template, false);
         Object.keys(output).filter(isSheetKey).forEach(key => {
@@ -1963,7 +1858,6 @@
             uid: key,
             name: name.trim(),
             content: [[null, '列1']],
-            exportConfig: normalizeExport({}, name.trim()),
             orderNo: orderedKeys(app.data).length,
         }, key, true);
         app.active = key;
@@ -2053,16 +1947,19 @@
         app.dirtyTemplate = true;
     }
     async function readJsonFile(file, isBackup) {
+        const targetApp = app;
+        const snapshot = { chat: chat(), chatId: currentChatId() };
         try {
             const parsed = parseJson(await file.text(), null);
+            if (app !== targetApp || !sameChatSnapshot(snapshot)) return;
             if (!parsed) throw new Error('JSON 格式不正确');
             if (isBackup && isObject(parsed.data)) {
-                app.data = removeBuiltinSheets(parsed.data, true);
+                app.data = normalizeData(parsed.data, true);
                 app.active = orderedKeys(app.data)[0] || null;
             } else {
                 const template = parsed.template || (parsed.mate ? parsed : null);
                 if (!template) throw new Error('文件中没有模板');
-                applyTemplateToCurrentData(removeBuiltins(template));
+                applyTemplateToCurrentData(template);
             }
             app.dirtyData = true;
             app.dirtyTemplate = true;
@@ -2071,6 +1968,13 @@
         } catch (error) {
             notify(`读取失败：${error.message}`, 'error');
         }
+    }
+    async function reloadAfterCleanup() {
+        app = null;
+        await loadModel();
+        render();
+        const snapshot = { chat: chat(), chatId: currentChatId() };
+        await queueWorldbookSync(app.data, { silent: true, isFresh: () => sameChatSnapshot(snapshot) });
     }
     function bindEvents(root) {
         const refreshDirty = () => {
@@ -2116,14 +2020,7 @@
                 if (!confirm(`确定删除 AI 第 ${range.start} 到第 ${range.end} 层（首尾包含）的精简版 checkpoint 吗？\n\n聊天正文、模板、普通 extra 和其它标签槽不会删除；这些历史 checkpoint 删除后不能恢复。若删除后剩余记录无法由完整 checkpoint 独立载入，插件会拒绝操作。${dirtyWarning}`)) return;
                 try {
                     const result = await runSave(session => deleteStoredFramesByAiFloor(range.start, range.end, session));
-                    app = null;
-                    await loadModel();
-                    render();
-                    if (!getFrameRefs(chat()).length) {
-                        await queueWorldbookSync({ mate: { type: 'chatSheets', version: 1 } }, { silent: true });
-                    } else {
-                        triggerProjectionSync();
-                    }
+                    await reloadAfterCleanup();
                     notify(result.removed ? `已删除 ${result.removed} 个旧 checkpoint，聊天 JSON 预计减少约 ${result.removedCharacters || 0} 字节。` : '指定范围内没有可安全删除的 checkpoint。', 'success');
                 } catch (error) { notify(`删除失败：${error?.message || error}`, 'error'); }
                 return;
@@ -2135,10 +2032,7 @@
                 if (!confirm(`这是卸载式操作：会删除整个聊天中所有已知数据库字段、旧剧情/向量/优化残留，并删除聊天模板、旧表头和 metadata owner。\n\n聊天正文不会删除，但本聊天的表结构需要以后重新导入。建议先导出数据备份。${dirtyWarning}\n\n确定继续吗？`)) return;
                 try {
                     const result = await runSave(deleteAllKnownPluginData);
-                    app = null;
-                    await loadModel();
-                    render();
-                    await queueWorldbookSync({ mate: { type: 'chatSheets', version: 1 } }, { silent: true });
+                    await reloadAfterCleanup();
                     notify(result.removed || result.metadataChanges?.length ? `已卸载本聊天数据库痕迹，预计减少约 ${result.removedCharacters || 0} 字节。` : '当前聊天没有发现已知数据库痕迹。', 'success');
                 } catch (error) { notify(`卸载式清理失败：${error?.message || error}`, 'error'); }
                 return;
@@ -2155,6 +2049,7 @@
         };
         root.oninput = event => {
             const element = event.target;
+            if (element.type === 'checkbox' || element.type === 'file' || element.tagName === 'SELECT') return;
             if (element.id === 'acu-save-floor') {
                 app.saveFloor = element.value;
                 root.querySelector('[data-act="save-all"]').textContent = saveButtonLabel();
@@ -2172,10 +2067,6 @@
                         const label = field.querySelector('.record-label')?.textContent || '';
                         field.classList.remove('short', 'medium', 'long');
                         field.classList.add(recordFieldSize(value, label));
-                    }
-                    if (column === 1) {
-                        const name = element.closest('.record-card')?.querySelector('.record-name');
-                        if (name && name !== element) name.textContent = text(value).trim();
                     }
                     app.dirtyData = true;
                 }
@@ -2214,6 +2105,7 @@
                     .catch(error => notify(`设置世界书失败：${error?.message || error}`, 'error'));
                 return;
             }
+            if (element.type !== 'checkbox' && element.tagName !== 'SELECT') return;
             const sheet = app.data[app.active];
             if (element.dataset.export && sheet) {
                 updateExportField(sheet, element.dataset.export, element);
@@ -2230,6 +2122,7 @@
         };
     }
 
+    /* -------------------- 窗口、菜单与启动 -------------------- */
     function closeApp() {
         removeEditorNotices();
         doc().getElementById(ROOT_ID)?.remove();
@@ -2264,19 +2157,11 @@
         // 菜单却没有任何反应”，列表完成后再刷新同一聊天的界面。
         render();
         const snapshot = { chat: chat(), chatId: currentChatId() };
-        const worldbookLoad = Promise.resolve().then(() => loadWorldbookOptions());
-        const refreshIfFresh = () => {
-            if (app && sameChatSnapshot(snapshot) && document.getElementById(ROOT_ID)) render();
-        };
-        worldbookLoad.then(refreshIfFresh).catch(() => { /* 世界书列表是可选能力 */ });
-        let timeoutId;
-        try {
-            await Promise.race([
-                worldbookLoad,
-                new Promise(resolve => { timeoutId = setTimeout(resolve, 2500); }),
-            ]);
-        } catch (_) { /* optional worldbook APIs may reject */ }
-        finally { if (timeoutId) clearTimeout(timeoutId); }
+        void loadWorldbookOptions().then(() => {
+            if (!app || !sameChatSnapshot(snapshot)) return;
+            const select = document.getElementById('acu-worldbook-target');
+            if (select) select.innerHTML = worldbookTargetOptionsHtml();
+        }).catch(() => { /* 世界书列表不可用不影响编辑器。 */ });
     }
     function menuClick(event) {
         event.preventDefault();
@@ -2351,34 +2236,23 @@
         if (!['Enter', ' '].includes(event.key) || !menuTargetFromEvent(event)) return;
         activateMenuFromEvent(event);
     }
-    function attachMenuDelegation() {
-        if (menuDelegationAttached) return;
-        const document = doc();
-        if (!document) return;
-        // 手机端会重建扩展菜单 DOM；监听 document 而不是菜单节点本身，
-        // 即使可见菜单项被 clone/innerHTML 替换，点击仍能到达编辑器。
-        document.addEventListener('click', activateMenuFromEvent, true);
-        document.addEventListener('pointerup', activateMenuFromEvent, true);
-        document.addEventListener('touchstart', rememberMenuTouch, { capture: true, passive: true });
-        document.addEventListener('touchend', activateMenuFromTouch, { capture: true, passive: false });
-        document.addEventListener('touchcancel', resetMenuTouch, { capture: true, passive: true });
-        document.addEventListener('keydown', activateMenuFromKeyboard, true);
-        menuDelegationAttached = true;
+    function bindMenuEvents(target, capture = false) {
+        const handlers = {
+            click: activateMenuFromEvent, pointerup: activateMenuFromEvent,
+            touchstart: rememberMenuTouch, touchend: activateMenuFromTouch,
+            touchcancel: resetMenuTouch, keydown: activateMenuFromKeyboard,
+        };
+        Object.entries(handlers).forEach(([type, handler]) => {
+            target.addEventListener(type, handler, {
+                capture, passive: type === 'touchstart' || type === 'touchcancel',
+            });
+        });
     }
-    function bindMenuItem(item) {
-        if (!item) return;
-        item.removeEventListener('click', activateMenuFromEvent);
-        item.removeEventListener('pointerup', activateMenuFromEvent);
-        item.removeEventListener('touchstart', rememberMenuTouch);
-        item.removeEventListener('touchend', activateMenuFromTouch);
-        item.removeEventListener('touchcancel', resetMenuTouch);
-        item.removeEventListener('keydown', activateMenuFromKeyboard);
-        item.addEventListener('click', activateMenuFromEvent);
-        item.addEventListener('pointerup', activateMenuFromEvent);
-        item.addEventListener('touchstart', rememberMenuTouch, { passive: true });
-        item.addEventListener('touchend', activateMenuFromTouch, { passive: false });
-        item.addEventListener('touchcancel', resetMenuTouch, { passive: true });
-        item.addEventListener('keydown', activateMenuFromKeyboard);
+    function attachMenuDelegation() {
+        if (menuDelegationAttached || !doc()) return;
+        // 捕获代理应对手机菜单重建；节点绑定保留 iOS 触摸入口。
+        bindMenuEvents(doc(), true);
+        menuDelegationAttached = true;
     }
     function stopMenuWatch() {
         if (menuRetryTimer) {
@@ -2395,7 +2269,7 @@
         if (!document) return false;
         const existing = document.getElementById(MENU_ID);
         if (existing) {
-            bindMenuItem(existing);
+            bindMenuEvents(existing);
             menuInstalled = true;
             stopMenuWatch();
             return true;
@@ -2416,7 +2290,7 @@
         item.tabIndex = 0;
         item.title = '打开数据库';
         item.innerHTML = '<div class="fa-fw fa-solid fa-table"></div><span>数据库</span>';
-        bindMenuItem(item);
+        bindMenuEvents(item);
         container.appendChild(item);
         menu.appendChild(container);
         menuInstalled = true;
@@ -2469,7 +2343,6 @@
         HOST[MINIMAL_INSTANCE_FLAG] = true;
         attachMenuDelegation();
         insertMenu();
-        attachChatListener();
         scheduleInitialProjection();
     }
     if (doc()?.readyState === 'loading') doc().addEventListener('DOMContentLoaded', boot, { once: true });
