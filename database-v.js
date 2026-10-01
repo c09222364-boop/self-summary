@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         数据库 V（可视化数据编辑精简版）
 // @namespace    http://tampermonkey.net/
-// @version      3.6.1
+// @version      3.6.2
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
 // @match        */*
@@ -695,7 +695,7 @@
     function checkpointInfo(messages) {
         const fullCheckpoints = getFrameRefs(messages)
             .filter(ref => hasUsableFullCheckpoint(ref.frame));
-        const latest = [...fullCheckpoints].reverse()[0];
+        const latest = fullCheckpoints.reduce((last, ref) => !last || Number(ref.frame.checkpoint.createdAt || 0) >= Number(last.frame.checkpoint.createdAt || 0) ? ref : last, null);
         return { latest, fullCheckpoints };
     }
     function aiFloorCount(messages) {
@@ -706,8 +706,8 @@
         if (!total) throw new Error('当前聊天还没有 AI 楼层，无法删除本地数据。');
         const startText = text(startFloor).trim();
         const endText = text(endFloor).trim();
-        const start = startText ? Number.parseInt(startText, 10) : 1;
-        const end = endText ? Number.parseInt(endText, 10) : total;
+        const start = startText ? Number(startText) : 1;
+        const end = endText ? Number(endText) : total;
         if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < 1 || start > end || end > total) {
             throw new Error(`请输入有效的 AI 楼层范围（1 到 ${total}，首尾均包含）。`);
         }
@@ -752,6 +752,7 @@
         const next = { ...extra };
         keys.forEach(key => delete next[key]);
         if (Object.keys(next).length) message.extra = next;
+        else delete message.extra;
         return true;
     }
     function removeAllKnownPluginData(messages, metadataObject = metadata()) {
@@ -916,11 +917,22 @@
         }
         return null;
     }
+    function selectedSaveTarget(messages, enabled, floor) {
+        if (!enabled) return lastAiMessage(messages);
+        const requested = Number(floor);
+        if (!Number.isInteger(requested) || requested < 1) throw new Error('请输入有效的 AI 楼层正整数。');
+        let count = 0;
+        for (let index = 0; index < messages.length; index += 1) {
+            const message = messages[index];
+            if (message && !message.is_user && ++count === requested) return { message, index };
+        }
+        throw new Error('指定的 AI 楼层不存在，请检查楼层范围。');
+    }
     async function writeCheckpoint(data, reason = 'manual_visualizer', saveSession = null) {
         const messages = saveSession?.chat || chat();
         const expectedChatId = saveSession?.chatId ?? currentChatId();
         if (saveSession) assertSaveSession(saveSession);
-        const target = lastAiMessage(messages);
+        const target = saveSession?.target || selectedSaveTarget(messages, saveSession?.customSaveEnabled, saveSession?.saveFloor);
         if (!target) throw new Error('当前聊天还没有 AI 楼层，无法按现行格式保存表格。');
         if (chat() !== messages || chat()[target.index] !== target.message || target.message.is_user
             || (expectedChatId && currentChatId() !== expectedChatId)) {
@@ -1177,8 +1189,6 @@
         return {
             applied: true,
             reason: '',
-            parsedRows: values.filter(Boolean).length,
-            blankRows: values.filter(value => !value).length,
             header: [...header.slice(0, insertAt), '距当前剧情', ...header.slice(insertAt)],
             rows: rows.map((row, index) => [...row.slice(0, insertAt), values[index], ...row.slice(insertAt)]),
         };
@@ -1266,13 +1276,11 @@
         }
         const managed = existing.filter(entry => text(entry?.comment).startsWith(scopedPrefix));
         const candidates = [];
-        const storyDate = latestStoryDate(chat());
+        const needsRelativeTime = orderedKeys(data).some(key => data[key].exportConfig?.enabled && data[key].exportConfig?.relativeTimeEnabled);
+        const storyDate = needsRelativeTime ? latestStoryDate(chat()) : null;
         const relativeTime = {
             enabledTables: 0,
             appliedTables: 0,
-            parsedRows: 0,
-            blankRows: 0,
-            skipped: [],
             anchor: storyDate,
         };
         const addCandidate = (identity, name, content, keys, placementConfig, type, preventRecursion) => {
@@ -1296,10 +1304,6 @@
                 relativeTime.enabledTables += 1;
                 if (projected.applied) {
                     relativeTime.appliedTables += 1;
-                    relativeTime.parsedRows += projected.parsedRows;
-                    relativeTime.blankRows += projected.blankRows;
-                } else {
-                    relativeTime.skipped.push({ key, name: sheet.name || key, reason: projected.reason });
                 }
             }
             const projectedRows = new Map(rows.map((row, index) => [row, projected.rows[index]]));
@@ -1487,6 +1491,8 @@
             chat: chat(),
             chatId: currentChatId(),
             data: minimalDataForWrite(app.data, true),
+            customSaveEnabled: app.customSaveEnabled,
+            saveFloor: app.saveFloor,
         };
     }
     function assertSaveSession(session) {
@@ -1538,6 +1544,8 @@
             dirtyTemplate: false,
             page: 0,
             reverseRows: false,
+            customSaveEnabled: false,
+            saveFloor: '',
         };
     }
     async function loadModel() {
@@ -1678,7 +1686,12 @@
     async function saveData(session = null) {
         const activeSession = session || createSaveSession();
         assertSaveSession(activeSession);
-        if (!lastAiMessage(activeSession.chat)) throw new Error('当前聊天还没有 AI 楼层，无法保存表格。');
+        activeSession.target = selectedSaveTarget(activeSession.chat, activeSession.customSaveEnabled, activeSession.saveFloor);
+        if (!activeSession.target) throw new Error('当前聊天还没有 AI 楼层，无法保存表格。');
+        if (activeSession.customSaveEnabled) {
+            const existing = isolatedContainer(activeSession.target.message, false)?.[SLOT];
+            if (existing && !confirm(`AI 第 ${activeSession.saveFloor} 层已有数据库数据，保存会覆盖该层快照。确定继续吗？`)) return false;
+        }
         // 每次手动保存都对白名单重写当前槽：既保留其它标签槽，又顺手物理
         // 移除旧 plot/templateArchives、SQL/自动填表配置与 TableHeaderGuide。
         const value = templateFromData(activeSession.data);
@@ -1694,9 +1707,10 @@
         activeSession.app.dirtyData = false;
         activeSession.app.dirtyTemplate = false;
         notify(`表格数据已保存到 AI 第 ${result.aiFloor} 层（消息 #${result.index}）。`, 'success');
+        return true;
     }
     async function saveAll(session) {
-        await saveData(session);
+        if (await saveData(session) === false) return;
         assertSaveSession(session);
         await queueWorldbookSync(session.data, {
             isFresh: () => app === session.app && chat() === session.chat
@@ -1708,6 +1722,8 @@
 
     /* -------------------- 单一奶油风界面 -------------------- */
     const CSS = `
+#${ROOT_ID} [hidden]{display:none!important}
+#${ROOT_ID} .manage-head{position:relative;display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}#${ROOT_ID} .manage-head h2{margin:0}#${ROOT_ID} .manage-head:last-child{margin-bottom:0}#${ROOT_ID} .manage-delete{margin-left:auto!important}#${ROOT_ID} .manage-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-top:14px}#${ROOT_ID} .manage-actions .btn,#${ROOT_ID} .manage-head .btn{position:static;float:none;transform:none;margin-top:0;margin-bottom:0;white-space:normal;height:auto;flex-shrink:0}#${ROOT_ID} .inline-help summary{display:flex;align-items:center;justify-content:center;width:22px;height:22px;border:1px solid var(--muted);border-radius:50%;cursor:pointer;color:var(--muted);font:italic 14px Georgia,serif;list-style:none}#${ROOT_ID} .inline-help summary::-webkit-details-marker{display:none}#${ROOT_ID} .inline-help[open] summary{color:var(--accent);border-color:var(--accent)}#${ROOT_ID} .inline-help p{position:absolute;z-index:5;left:0;right:0;top:100%;margin:6px 0 0;padding:12px;border:1px solid var(--line);border-radius:4px;background:var(--paper);box-shadow:0 5px 16px #0002}#${ROOT_ID} #acu-save-floor-field{margin-top:10px}
 #${ROOT_ID}{--canvas:#fbf8f1;--paper:#fffdf8;--paper-warm:#fffaf2;--paper2:#f4ede2;--line:#ddd2c1;--line-soft:#ebe3d6;--ink:#403a32;--muted:#81786b;--accent:#3978a8;--accent-soft:#eaf2f8;--accent-border:#a9c6da;--accent-ink:#2e638b;--accent-ring:rgba(57,120,168,.22);--danger:#b4625c;position:fixed;top:0;right:0;bottom:0;left:0;inset:0;width:100vw;height:100vh;height:100dvh;z-index:2147483000;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:var(--ink);font-size:13px;line-height:1.4;touch-action:manipulation}
 #${ROOT_ID}[data-accent="green"]{--accent:#4f8068;--accent-soft:#e8f1e9;--accent-border:#b6c9ba;--accent-ink:#3d6e58;--accent-ring:rgba(79,128,104,.2)}
 #${ROOT_ID} *{box-sizing:border-box}#${ROOT_ID} button,#${ROOT_ID} input,#${ROOT_ID} select,#${ROOT_ID} textarea{font:inherit}#${ROOT_ID} .mask{position:absolute;top:0;right:0;bottom:0;left:0;inset:0;background:rgba(57,51,43,.38);backdrop-filter:blur(1.5px);display:flex;align-items:center;justify-content:center;padding:clamp(12px,2.5vw,28px)}#${ROOT_ID} .open-loading{min-width:180px;padding:18px 22px;border:1px solid var(--line);border-radius:5px;background:var(--paper);box-shadow:0 16px 42px rgba(57,46,34,.18);color:var(--muted);font-weight:600;text-align:center}
@@ -1795,7 +1811,7 @@
           <header class="head"><h1>数据库</h1><span class="spacer"></span><span class="sub chat-id">${esc(currentChatId() || '未连接聊天')}</span><button class="iconbtn theme-toggle" data-act="toggle-theme" aria-pressed="${uiAccentTheme === 'green' ? 'true' : 'false'}" aria-label="${uiAccentTheme === 'blue' ? '切换为绿色' : '切换为蓝色'}" title="${uiAccentTheme === 'blue' ? '切换为绿色' : '切换为蓝色'}"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2.5c-5.24 0-9.5 3.83-9.5 8.55 0 3.86 3.14 7 7 7h1.12c.62 0 1-.67.69-1.21-.62-1.08.16-2.43 1.4-2.43h3.42c2.97 0 5.37-2.4 5.37-5.37C21.5 5.43 17.24 2.5 12 2.5Z"/><circle cx="7" cy="10.4" r="1.15" fill="var(--paper)"/><circle cx="9.3" cy="6.8" r="1.15" fill="var(--paper)"/><circle cx="13.5" cy="6.3" r="1.15" fill="var(--paper)"/><circle cx="17.1" cy="8.6" r="1.15" fill="var(--paper)"/></svg></button><button class="iconbtn" data-act="close" aria-label="关闭">×</button></header>
           <div class="body"><aside class="side" aria-label="表格选择"><div class="side-title">当前表格 · ${keys.length}</div><div id="acu-sheet-list"></div><div class="side-actions"><button class="minibtn" data-act="add-sheet">＋ 新表</button><button class="minibtn" data-act="delete-sheet">删除表</button></div></aside>
           <div class="main"><nav class="tabs" aria-label="编辑器页面"><button class="tab ${app.mode === 'data' ? 'active' : ''}" data-mode="data">数据</button><button class="tab ${app.mode === 'config' ? 'active' : ''}" data-mode="config">结构与注入</button><button class="tab ${app.mode === 'template' ? 'active' : ''}" data-mode="template">模板</button><button class="tab ${app.mode === 'status' ? 'active' : ''}" data-mode="status">状态</button><button class="tab ${app.mode === 'backup' ? 'active' : ''}" data-mode="backup">数据管理</button></nav><main class="content" id="acu-content"></main></div></div>
-          <footer class="foot"><span class="dirty">${app.dirtyData || app.dirtyTemplate ? '有未保存修改' : '已保存'}</span><span class="grow"></span><button class="btn" data-act="save-all">保存并同步世界书</button></footer>
+          <footer class="foot"><span class="dirty">${app.dirtyData || app.dirtyTemplate ? '有未保存修改' : '已保存'}</span><span class="grow"></span><button class="btn" data-act="save-all">${esc(saveButtonLabel())}</button></footer>
         </section></div>`;
         const list = root.querySelector('#acu-sheet-list');
         keys.forEach(key => {
@@ -1882,16 +1898,28 @@
         element.innerHTML = `<section class="card"><h2>当前聊天状态</h2><div class="status-list">
           <div class="stat"><b>聊天标识</b><span>${esc(currentChatId() || '未连接')}</span></div><div class="stat"><b>表格 / 数据行</b><span>${status.tables} / ${status.rows}</span></div>
           <div class="stat"><b>当前聊天 AI 楼层</b><span>${aiFloorCount(chat())}</span></div><div class="stat"><b>最近一次保存</b><span>${esc(latestLabel)}</span></div>
-          <div class="stat"><b>保存时间</b><span>${checkpoint?.createdAt ? new Date(checkpoint.createdAt).toLocaleString() : '尚未保存'}</span></div><div class="stat"><b>写入方式</b><span>每次保存都是完整 checkpoint</span></div>
+          <div class="stat"><b>保存时间</b><span>${checkpoint?.createdAt ? new Date(checkpoint.createdAt).toLocaleString() : '尚未保存'}</span></div>
           <div class="stat full-checkpoint-stat"><b>已保存 full checkpoint 的 AI 楼层</b><span>${esc(fullCheckpointLabel)}</span></div>
           </div></section>`;
     }
+    function helpHtml(title, description) {
+        return `<details class="inline-help"><summary aria-label="${esc(title)}说明">i</summary><p class="hint">${esc(description)}</p></details>`;
+    }
+    function saveButtonLabel() {
+        return app.customSaveEnabled
+            ? `保存到 AI 第 ${app.saveFloor || '…'} 层并同步世界书`
+            : '保存并同步世界书';
+    }
     function renderBackup(element) {
-        const summary = { tables: orderedKeys(app.data).length, rows: modelStatus().rows, messageCount: chat().length, note: '备份只包含当前模板和表格数据。' };
-        element.innerHTML = `<section class="card"><h2>数据管理</h2><p class="hint">备份只包含当前编辑器可见的模板和数据，不复制整段聊天。导入后仍需点击底部“保存并同步世界书”才会写回聊天；要物理减小聊天文件，请删除旧 checkpoint。</p><div class="toolbar"><button class="btn secondary" data-act="download-backup">导出数据备份</button><label class="btn secondary" for="acu-backup-file">导入数据备份</label><input class="file" id="acu-backup-file" type="file" accept="application/json"></div><div class="code">${esc(JSON.stringify(summary, null, 2))}</div></section>`;
         const totalAiFloors = aiFloorCount(chat());
-        element.innerHTML += `<section class="card"><h2>删除旧 checkpoint（按 AI 楼层）</h2><p class="hint">首尾均包含，留空表示从第一层到最后一层。这里只删除本精简版空标签槽中的完整 checkpoint，不碰聊天正文、普通 extra、模板或其它标签槽；删除后剩余记录必须仍能由一份完整 checkpoint 独立载入，否则操作会被拒绝。</p><div class="grid2"><div class="field"><label>起始 AI 楼层</label><input id="acu-delete-start" type="number" min="1" max="${totalAiFloors || 1}" placeholder="1"></div><div class="field"><label>结束 AI 楼层</label><input id="acu-delete-end" type="number" min="1" max="${totalAiFloors || 1}" placeholder="${totalAiFloors || 1}"></div></div><div class="toolbar"><span class="hint">当前聊天共 ${totalAiFloors} 个 AI 楼层</span><span class="grow"></span><button class="btn warn" data-act="delete-ai-range" ${totalAiFloors ? '' : 'disabled'}>删除范围内 checkpoint</button></div></section>`;
-        element.innerHTML += `<section class="card"><h2>卸载式清理当前聊天</h2><p class="hint">删除整个聊天中的所有已知旧/新数据库字段，并一并移除首楼模板、ScopedConfig、旧表头和 metadata owner。聊天正文不动，但下次打开不会再有本聊天的表结构；建议先导出备份。</p><div class="toolbar"><span class="grow"></span><button class="btn warn" data-act="purge-chat-data" ${chat().length ? '' : 'disabled'}>彻底移除本聊天数据库痕迹</button></div></section>`;
+        element.innerHTML = `<section class="card"><div class="manage-head"><h2>数据管理</h2>${helpHtml('数据管理', '备份只包含当前模板和表格数据。导入后点击保存才会写回聊天；删除旧 checkpoint 可减小聊天文件。')}</div><div class="toolbar"><button class="btn secondary" data-act="download-backup">导出数据备份</button><label class="btn secondary" for="acu-backup-file">导入数据备份</label><input class="file" id="acu-backup-file" type="file" accept="application/json"></div></section>
+          <section class="card"><div class="manage-head"><h2>保存位置</h2>${helpHtml('保存位置', '默认保存到最新 AI 楼层。指定旧楼层会保存当前编辑器的完整表格，不删除后续快照；重新载入仍读取位置最后的快照。关闭编辑器或切换聊天后恢复默认。')}</div>
+          <label class="check"><input id="acu-custom-save" type="checkbox" ${app.customSaveEnabled ? 'checked' : ''}>保存到指定 AI 楼层</label>
+          <div class="field" id="acu-save-floor-field" ${app.customSaveEnabled ? '' : 'hidden'}><label for="acu-save-floor">目标 AI 楼层（1–${totalAiFloors}）</label><input id="acu-save-floor" type="number" min="1" max="${totalAiFloors}" step="1" value="${esc(app.saveFloor)}" placeholder="${totalAiFloors || 1}"></div></section>
+          <section class="card"><div class="manage-head"><h2>删除旧 checkpoint（按 AI 楼层）</h2>${helpHtml('删除旧 checkpoint', '首尾均包含，留空表示从第一层到最后一层。只删除本精简版空标签槽的完整 checkpoint；聊天正文、模板和其他标签槽保留。剩余记录须能由完整 checkpoint 独立载入。')}</div>
+          <div class="grid2"><div class="field"><label for="acu-delete-start">起始 AI 楼层</label><input id="acu-delete-start" type="number" min="1" max="${totalAiFloors || 1}" placeholder="1"></div><div class="field"><label for="acu-delete-end">结束 AI 楼层</label><input id="acu-delete-end" type="number" min="1" max="${totalAiFloors || 1}" placeholder="${totalAiFloors || 1}"></div></div>
+          <div class="manage-actions"><span class="hint">当前聊天共 ${totalAiFloors} 个 AI 楼层</span><button class="btn warn" data-act="delete-ai-range" ${totalAiFloors ? '' : 'disabled'}>删除范围内 checkpoint</button></div></section>
+          <section class="card"><div class="manage-head"><h2>卸载式清理当前聊天</h2>${helpHtml('卸载式清理当前聊天', '删除整个聊天中已知的新旧数据库字段、首楼模板、ScopedConfig、旧表头和 metadata owner。聊天正文保留，表结构需要重新导入，建议先导出备份。')}<button class="btn warn manage-delete" data-act="purge-chat-data" ${chat().length ? '' : 'disabled'}>彻底移除本聊天数据库痕迹</button></div></section>`;
     }
     function buildBackup() {
         return {
@@ -2127,6 +2155,11 @@
         };
         root.oninput = event => {
             const element = event.target;
+            if (element.id === 'acu-save-floor') {
+                app.saveFloor = element.value;
+                root.querySelector('[data-act="save-all"]').textContent = saveButtonLabel();
+                return;
+            }
             if (element.dataset.cellRow) {
                 const sheet = app.data[app.active];
                 const row = Number(element.dataset.cellRow);
@@ -2165,6 +2198,14 @@
         };
         root.onchange = event => {
             const element = event.target;
+            if (element.id === 'acu-custom-save') {
+                app.customSaveEnabled = element.checked;
+                if (element.checked && !app.saveFloor) app.saveFloor = String(aiFloorCount(chat()) || '');
+                root.querySelector('#acu-save-floor-field').hidden = !element.checked;
+                root.querySelector('#acu-save-floor').value = app.saveFloor;
+                root.querySelector('[data-act="save-all"]').textContent = saveButtonLabel();
+                return;
+            }
             if (element.id === 'acu-template-file' && element.files?.[0]) { void readJsonFile(element.files[0], false); return; }
             if (element.id === 'acu-backup-file' && element.files?.[0]) { void readJsonFile(element.files[0], true); return; }
             if (element.id === 'acu-worldbook-target') {
