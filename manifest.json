@@ -3,10 +3,10 @@
     "loading_order": 100,
     "requires": [],
     "optional": [],
-    "js": "database-v.js",
+    "js": "database.js",
     "css": "",
     "author": "c09222364-boop",
-    "version": "3.6.4",
+    "version": "3.6.5",
     "homePage": "https://github.com/c09222364-boop/self-summary",
     "auto_update": true
 }

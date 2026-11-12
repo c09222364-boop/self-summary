@@ -1,13 +1,4 @@
-// ==UserScript==
-// @name         数据库 V（可视化数据编辑精简版）
-// @namespace    http://tampermonkey.net/
-// @version      3.6.4
-// @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
-// @author       Cline (AI Assisted)
-// @match        */*
-// @run-at       document-idle
-// @grant        none
-// ==/UserScript==
+// 自用总结 · SillyTavern 扩展。原脚本署名：Cline (AI Assisted)。
 (function () {
     'use strict';
 

@@ -9,9 +9,10 @@
 3. 粘贴仓库地址：`https://github.com/c09222364-boop/self-summary`
 4. 安装后刷新酒馆。
 
-## Userscript 兼容入口
+## 3.6.5
 
-如果使用 Tampermonkey 或 Violentmonkey，可以直接安装 [database-v.js](./database-v.js)。
+- 酒馆通过 `manifest.json` 直接加载根目录的 [database.js](./database.js)，本仓库提供未混淆的可读源码。
+- 此次只更换发布入口；原有聊天字段、世界书标记和设置键保持不变。
 
 ## 3.6.4
 
