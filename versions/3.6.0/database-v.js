@@ -1,6 +1,5 @@
 // ==UserScript==
-// @name         数据库 V（可视化数据编辑精简版）
-// @namespace    http://tampermonkey.net/
+// @name         数据库（精简版）
 // @version      3.6.0
 // @description  只提供当前聊天的表格数据、模板结构、列定义和世界书注入位置编辑。
 // @author       Cline (AI Assisted)
